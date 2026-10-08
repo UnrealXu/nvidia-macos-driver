@@ -1,0 +1,36 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # Every 6 hours, at minute 17 (UTC).
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'UnrealXu/nvidia-macos-driver'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Sync main from nullmoth/nvidia-macos-driver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api --method POST             -H "Accept: application/vnd.github+json"             "repos/$TARGET_REPOSITORY/merge-upstream"             -f branch=main | tee sync-result.json
+          {
+            echo '### Upstream sync result'
+            echo 'Source: nullmoth/nvidia-macos-driver (main)'
+            echo 'Target: UnrealXu/nvidia-macos-driver (main)'
+            echo '```json'
+            cat sync-result.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

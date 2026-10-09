@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 
+#include "../nvrm_off.h"
 #include <IOKit/graphics/IOGraphicsTypes.h>
 #ifndef detailedTimingModeID
 #define detailedTimingModeID __reservedA[0]
@@ -262,6 +263,9 @@ class NVRMFBClaim : public IOService
 public:
     bool start(IOService *provider) override
     {
+        // With the driver off, leave the slot to IONDRVFramebuffer so the firmware's display stays lit while the
+        // removal runs. WAS: the claim held it anyway and the screen stayed dark until the second restart.
+        if (nvrm_driver_off()) return false;
         if (!IOService::start(provider)) return false;
         IOLog("NVRMFB: NVRMFBClaim holds the IOFramebuffer match category on %s - IONDRVFramebuffer blocked\n",
               provider ? provider->getName() : "?");
@@ -1281,7 +1285,7 @@ static void nvrmDiscoverBar1(IOService *provider, NvU64 *length, NvU64 *base)
 }
 bool NVRMNVDAFramebuffer::start(IOService *provider)
 {
-    { char nvoff[8]; if (PE_parse_boot_argn("-nvoff", nvoff, sizeof nvoff)) return false; }
+    { if (nvrm_driver_off()) return false; }
     {
         int gate = 0;
         if (!PE_parse_boot_argn("nvfb", &gate, sizeof gate) || !gate) {

@@ -106,6 +106,26 @@ if [ -n "$COLLECT" ]; then
   # copies files and prints state, and unmounts any EFI partition it mounted. Every OpenCore partition is checked,
   # sticks included, for OpenCore's own log (opencore-*.txt) and macOS panics it saved (panic-*.txt).
   mkdir -p "$COLLECT" || { echo "RESULT stop"; exit 1; }
+  # "Record flicker": 20 s of display timing taken while the user sees the flicker, before anything else runs. The
+  # accelerator's zero-copy flip counters and the framebuffer's commit/flip properties every 0.25 s, the driver's
+  # kernel messages, WindowServer's CPU and the refresh rate. Flicker never shows on a 60 Hz single-display test Mac,
+  # so the users' own machines are the measurement.
+  if [ "${NULLMOTH_SAMPLE:-}" = flicker ]; then
+    { echo "== display timing sample, $(date -u +%Y-%m-%dT%H:%M:%SZ), 20 s at 0.25 s"
+      system_profiler SPDisplaysDataType 2>/dev/null | grep -E "Resolution|Refresh|UI Looks|Display Type|Connection Type|Online"
+      /usr/bin/log stream --style compact --predicate 'sender == "NVRMFB" OR sender == "NVRM" OR sender == "NVAccel"' > "$COLLECT/.flicker-kmsg" 2>&1 &
+      lp=$!
+      i=0; while [ $i -lt 80 ]; do
+        echo "-- t=$(( i * 250 ))ms"
+        sysctl debug 2>/dev/null | grep -E "nvaccel_(iop|flip|vbl|swap|present|async|crc)|nvrmfb" | tr '\n' ' '; echo
+        ioreg -r -c NVRMNVDAFramebuffer -d 1 2>/dev/null | grep -E '"NVRM(RejectedCommits|Flip|Vbl|Present)|"IOFBCurrentPixelClock' | tr -s ' ' | tr '\n' ' '; echo
+        ps -A -o %cpu=,comm= 2>/dev/null | grep -E "WindowServer$" | head -1
+        sleep 0.25; i=$((i + 1))
+      done
+      kill "$lp" 2>/dev/null; wait "$lp" 2>/dev/null
+      echo; echo "== driver kernel messages during the sample"; tail -c 200000 "$COLLECT/.flicker-kmsg"; rm -f "$COLLECT/.flicker-kmsg"
+    } > "$COLLECT/display-flicker-sample.txt" 2>&1
+  fi
   for f in "$ST"/*.log "$ST/state"; do [ -f "$f" ] && cp "$f" "$COLLECT/driver-$(basename "$f").txt"; done
   { echo "macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion))   model $(sysctl -n hw.model)"
     echo "boot-args: $(nvram boot-args 2>/dev/null | cut -f2-)"; echo "SIP: $(csrutil status 2>/dev/null)"
@@ -217,8 +237,23 @@ fi
 
 if [ $REMOVE = 1 ]; then
   step "Removing the NullMoth driver"
-  [ -f "$STATE" ] || stop "no install record in $STATE - was the driver installed by this app?"
-  . "$STATE" || stop "the install record is invalid - nothing changed"
+  if [ -f "$STATE" ]; then
+    . "$STATE" || stop "the install record is invalid - nothing changed"
+  else
+    # A driver installed from the 1401 stick, by hand, or by an app whose record was lost has no install record, and
+    # removal used to stop here (1.8 log 10-10), leaving the user with a driver they could not take out. Without a
+    # record nothing is restored from a backup: the driver's own settings come out of the OpenCore config this Mac
+    # started from (or the one selected), and the uninstaller removes its files.
+    note "no install record in $STATE; removing the driver from the OpenCore config this Mac started from"
+    CONFIG_SHA_AFTER=""; ADDED_ARGS=""; REMOVED_ARGS=""; CONFIG_BACKUP_REL=""
+    if [ -z "$CFG" ] && [ "$EFI" = auto ]; then
+      d=$(booted_part) || d=$(boot_esp)
+      [ -n "$d" ] || stop "no install record, and the OpenCore partition this Mac started from was not found; select its config.plist - nothing changed"
+      mount_efi "$d" || stop "could not mount the OpenCore partition $d - nothing changed"
+      r=$(ocrel_in "$MOUNT_POINT"); [ -n "$r" ] || stop "no OpenCore config for this Mac on $d; select its config.plist - nothing changed"
+      CONFIG_PATH="$MOUNT_POINT/$r/config.plist"; OCREL=$r
+    fi
+  fi
   C=""; MP=""
   if [ -n "$CFG" ]; then
     C=$CFG; [ -f "$C" ] || stop "the selected OpenCore config is missing - nothing changed"
@@ -298,7 +333,7 @@ if [ $REMOVE = 1 ]; then
     rm -f "$MP/${OCREL:-EFI/OC}/Tools/$TOOL_FILE" || stop "could not remove the picker tool; recovery remains available"
     ok "OpenCore removal settings published"
   fi
-  mv "$STATE" "$STATE.removed-$(date +%Y%m%d-%H%M%S)" || stop "could not archive the install record"
+  if [ -f "$STATE" ]; then mv "$STATE" "$STATE.removed-$(date +%Y%m%d-%H%M%S)" || stop "could not archive the install record"; fi
   rm -f "$AGENT" "$RECOVER" "$ST/nullmoth-recover.sh"
   ok "done - restart to finish"; cleanup; echo "RESULT ok"; exit 0
 fi
@@ -570,6 +605,23 @@ if [ "$sbm" != Disabled ]; then
   echo "CHANGE SecureBootModel: ${sbm:-unset} -> Disabled (Apple Secure Boot refuses kexts Apple did not sign)"
   EDITS+=("Misc.Security.SecureBootModel|-string|Disabled"); OLDSBM=${sbm:-Default}
 fi
+# AMFIPass (a Lilu plugin) is what lets WindowServer, a platform binary, load the ad hoc signed driver: with it off and
+# the same SIP bits and amfi boot-args, 1.9.0 logs (10-10, Ryzen 9 9900X) show "mapping process is a platform binary,
+# but mapped file is not", no Metal device and a black screen with a cursor. Every working machine has it on.
+kpos() { local i=0 p; while p=$(get Kernel.Add.$i.BundlePath); do [ "$p" = "$1" ] && { echo $i; return; }; i=$((i+1)); done; }
+KX="$(dirname "$C")/Kexts"; NEEDAMFIPASS=0
+for k in Lilu.kext AMFIPass.kext; do
+  ki=$(kpos $k)
+  if [ -n "$ki" ]; then
+    [ "$(get Kernel.Add.$ki.Enabled)" = true ] || { echo "CHANGE Kernel -> Add: turn $k on (the driver cannot load without it)"; EDITS+=("Kernel.Add.$ki.Enabled|-bool|true"); }
+  elif [ $k = AMFIPass.kext ] && [ -d "$KX/AMFIPass.kext" ] && [ -n "$(kpos Lilu.kext)" ]; then
+    echo "CHANGE Kernel -> Add: add AMFIPass.kext after Lilu (the driver cannot load without it)"; NEEDAMFIPASS=1
+  else
+    stop "$k is not in this OpenCore EFI ($KX). The driver needs Lilu and AMFIPass; build the EFI again with 1401, or add them, then try again"
+  fi
+done
+lp=$(kpos Lilu.kext); ap=$(kpos AMFIPass.kext)
+[ -n "$ap" ] && [ "$ap" -lt "$lp" ] && stop "AMFIPass.kext loads before Lilu.kext in Kernel -> Add; move it below Lilu in the config, then try again"
 # The macOS installer boots with a small GPU BAR (ResizeAppleGpuBars 0, so its fallback screen survives PCI setup); the
 # driver was tested with the card's full 8 GB BAR, so the installed system gets that back.
 bar=$(get UEFI.Quirks.ResizeGpuBars); abar=$(get Booter.Quirks.ResizeAppleGpuBars)
@@ -622,7 +674,7 @@ if nvram 7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-remove >/dev/null 2>&1 &&
   DELADD+=("nullmoth-remove"); echo "CHANGE NVRAM Delete: add nullmoth-remove (a leftover remove flag this Mac cannot clear from macOS)"
 fi
 NEEDTOOL=0; [ -z "$(tool_index)" ] && { NEEDTOOL=1; echo "CHANGE boot picker: add \"$TOOL_NAME\" (the way back if the driver ever stops macOS starting)"; }
-[ ${#EDITS[@]} = 0 ] && [ ${#DELADD[@]} = 0 ] && [ $NEEDTOOL = 0 ] && [ $NEEDBLOCK = 0 ] && ok "OpenCore already has every setting the driver needs"
+[ ${#EDITS[@]} = 0 ] && [ ${#DELADD[@]} = 0 ] && [ $NEEDTOOL = 0 ] && [ $NEEDBLOCK = 0 ] && [ $NEEDAMFIPASS = 0 ] && ok "OpenCore already has every setting the driver needs"
 
 if [ $SIPON = 1 ]; then
   note "SIP is still fully on in this boot: only SIP, Secure Boot, boot arguments and the boot picker entry change now"
@@ -647,6 +699,9 @@ if [ $DRY = 0 ]; then
   if [ $NEEDBLOCK = 1 ]; then
     has Kernel.Block || plutil -insert Kernel.Block -array "$C" || fail=1
     plutil -insert Kernel.Block -json '{"Arch":"Any","Comment":"boot framebuffer IONDRVFramebuffer steals index 0 from NVRMFB","Enabled":true,"Identifier":"com.apple.iokit.IONDRVSupport","MaxKernel":"","MinKernel":"","Strategy":"Exclude"}' -append "$C" || fail=1
+  fi
+  if [ $NEEDAMFIPASS = 1 ]; then
+    plutil -insert Kernel.Add -json '{"Arch":"Any","BundlePath":"AMFIPass.kext","Comment":"AMFIPass (NullMoth driver)","Enabled":true,"ExecutablePath":"Contents/MacOS/AMFIPass","MaxKernel":"","MinKernel":"","PlistPath":"Contents/Info.plist"}' -append "$C" || fail=1
   fi
   if [ ${#DELADD[@]} -gt 0 ]; then
     has NVRAM.Delete || plutil -insert NVRAM.Delete -dictionary "$C" || fail=1
@@ -809,6 +864,15 @@ SINCE=$(date -r "$(sysctl -n kern.boottime | sed -E 's/.*\{ sec = ([0-9]+),.*/\1
 capture "BEFORE restart"
 SINCE=$(date '+%Y-%m-%d %H:%M:%S')
 : > "$MARK"   # claim the single shot BEFORE touching WindowServer, so a respawn can never loop
+# Only ever at the login window. 1.9.0 (10-10): with auto-login the session already existed when this fired, so the
+# restart logged the user out to the password screen. A restart under a logged-in user ends their session; never do it.
+CONSOLE=$(stat -f%Su /dev/console 2>/dev/null)
+if [ -n "$(defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null)" ]; then
+  echo "$(date) skipped the restart: auto-login is on (a restart would end the automatic session)" >> "$LOG" 2>&1; exit 0
+fi
+if [ -n "$CONSOLE" ] && [ "$CONSOLE" != root ]; then
+  echo "$(date) skipped the restart: $CONSOLE is already logged in" >> "$LOG" 2>&1; exit 0
+fi
 P=$(pgrep -x WindowServer); [ -n "$P" ] && { kill -TERM $P 2>/dev/null; sleep 2; pgrep -x WindowServer >/dev/null 2>&1 && kill -9 $P 2>/dev/null; }
 for i in $(seq 1 30); do pgrep -x WindowServer >/dev/null 2>&1 && break; sleep 1; done
 sleep 8

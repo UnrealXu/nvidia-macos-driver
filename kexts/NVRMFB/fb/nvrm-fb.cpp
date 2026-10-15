@@ -23,7 +23,9 @@
 #include <IOKit/ndrvsupport/IOMacOSVideo.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSString.h>
+#include <libkern/c++/OSData.h>
 #include <libkern/OSAtomic.h>
+#include "../nvrm_eld.h"
 #include "nvrm-hud.h"
 #include "nvrm-fb-safety.h"
 #include "nvrm-allocation-table.h"
@@ -51,11 +53,51 @@ extern "C" {
 
 // Surfaces may use half of a resizable BAR1 (>= 4 GB) and three quarters of a smaller one. WAS: a fixed 192 MB below
 // 4 GB, which is 3/4 of the 256 MB firmware window but left a 512 MB or 1 GB BAR1 no better off (issue #27).
+// A BAR1 under 256 MB (64 MB on some RTX 2060 boards) gets three quarters of itself too: the 192 MB floor promised
+// three times the window, so allocations failed inside mapMemory instead of being budgeted. Unknown (0) keeps 192 MB.
 static inline uint64_t nvrmVramBudget(uint64_t barLen)
 {
     if (barLen >= (4ull << 30)) return barLen / 2;
     uint64_t b = barLen / 4 * 3;
+    if (barLen && barLen < (256ull << 20)) return b;
     return b > NVRM_VRAM_BAR1_BUDGET ? b : NVRM_VRAM_BAR1_BUDGET;
+}
+
+// The framebuffer's own scanout and cursor sit in BAR1 (useVideoMemory), yet the accel budget above never counted them,
+// so the blind 3/4 fraction both wasted the BAR1 the display was not using on a small display and over-promised it on a
+// large one. An RTX 2070 Super (256 MB BAR1, no larger size offered, 3840x2560) spent its 192 MB budget while ~40 MB of
+// scanout went uncounted: WindowServer's surfaces were refused and the desktop stayed black with a cursor (user logs:
+// "BAR1 budget spent (200015872 of 201326592 bytes)" with NVAccel allocPhysical REFUSED). The budget is now
+// the BAR1 the display is not holding, less a margin for RM's own mappings (which are not in gVramMappedBytes); a large
+// display lowers it instead of overflowing the aperture. gVramDisplayBytes is the measured scanout+cursor; 0 means the
+// scanout is not mapped yet, so the conservative policy stands until it is.
+static volatile SInt64 gVramDisplayBytes = 0;
+static int gVramDisplayAware = 1;
+static inline uint64_t nvrmSurfaceBudget(uint64_t barLen, SInt64 displayBytes)
+{
+    if (barLen >= (4ull << 30)) return barLen / 2;        // resizable BAR: half, the display is a rounding error
+    if (!gVramDisplayAware || displayBytes <= 0)
+        return nvrmVramBudget(barLen);                     // display not measured yet -- keep the conservative policy
+    const uint64_t margin = 16ull << 20;                   // RM's own BAR1 mappings are not tracked in gVramMappedBytes
+    const uint64_t reserve = (uint64_t)displayBytes + margin;
+    if (reserve >= barLen) return nvrmVramBudget(barLen);  // pathological (display fills the window) -- fall back
+    return barLen - reserve;
+}
+
+// EDID base block bytes 21 and 22 hold the panel's physical size in centimetres. macOS wants it in
+// millimetres, per mode, through IODisplayModeInformation.imageWidth/imageHeight -- IOGraphicsTypes.h
+// calls them "physical width/height of active image if known, in millimeters, otherwise zero", and
+// IOFramebuffer passes the two fields straight through (they appear nowhere in IOFramebuffer.cpp).
+// Left at zero, Core Graphics has no size for the display: CGDisplayScreenSize() returns the bounds
+// at 25.4/72 mm per pixel, every mode carries kDisplayModeTelevisionFlag, and a 21.5" 1920x1080
+// panel is reported as a 30-inch TV in About This Mac. Issue #126.
+static void nvrmEdidPanelSizeMm(const NvU8 *edid, NvU16 size, NvU16 *mmW, NvU16 *mmH)
+{
+    *mmW = 0; *mmH = 0;
+    if (size < 128) return;
+    if (!edid[21] || !edid[22]) return;   // unknown size, or the EDID 1.4 aspect-ratio encoding
+    *mmW = (NvU16)(edid[21] * 10);
+    *mmH = (NvU16)(edid[22] * 10);
 }
 
 typedef NvU64 (*nvrm_phys_for_va_t)(const void *va);
@@ -206,6 +248,9 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     bool fConsoleAperture = false;
     NvU64 fBar1Base = 0;
     NvU8 fEdid[NVKMS_KAPI_EDID_BUFFER_SIZE]; NvU16 fEdidSize = 0;
+    // The panel's physical size in millimetres, from the EDID's base block. Reported per mode as
+    // IODisplayModeInformation.imageWidth/imageHeight; see nvrmEdidPanelSizeMm().
+    NvU16 fEdidMmW = 0, fEdidMmH = 0;
     bool fModeSet = false;
     unsigned fHomePure = 0;
     IODetailedTimingInformationV2 fDT[128]; unsigned fNDT = 0;
@@ -219,11 +264,14 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     // firmware started at 2560x1440 has a 3840-wide scaler limit, yet 5120x1440 needs less memory than 3840x2160.
     NvU32 fRasterMaxW = 0;
     NvU64 fAllocSize = 0, fMemBytes = 0;
+    // The scanout and cursor bytes this head mapped into BAR1 (video memory only), counted once into gVramDisplayBytes.
+    NvU64 fScanoutBarBytes = 0, fCursorBarBytes = 0;
     unsigned fModeSwitches = 0, fValidateCalls = 0, fValidateOk = 0;
     bool fBootInDT = false;
     int dtIndex(IODisplayModeID id) const;
     bool edidModeFor(const IODetailedTimingInformationV2 *d, struct NvKmsKapiDisplayMode *m);
     unsigned addKmsRefreshModes(unsigned n);
+    void computeScanoutCaps(NvU32 pitchAlign);
     unsigned fEdidHits = 0;
     static void dtToKapi(const IODetailedTimingInformationV2 *d, struct NvKmsKapiDisplayMode *m);
     IOReturn switchMode(IODisplayModeID id, const struct NvKmsKapiDisplayMode &m, NvU32 w, NvU32 h);
@@ -242,6 +290,10 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     unsigned fHudFrames = 0;
     NvU32 fNumHeads = 0, fNumConnectors = 0;
     struct { IOFBInterruptProc proc; OSObject *target; void *ref; } fVbl = {}, fConnect = {};
+    // This instance exists because a display appeared after boot (see gNDpyBoot), and its connect handler has already
+    // been fired once -- see connectNotifyFire and enableController.
+    bool fHotplugBorn = false, fConnectFired = false;
+    static void connectNotifyFire(thread_call_param_t p0, thread_call_param_t);
     volatile SInt32 fStopping = 0;
     void scheduleCall(thread_call_t call, uint64_t deadline);
     thread_call_t fSampler = nullptr; unsigned fSamples = 0;
@@ -388,6 +440,10 @@ struct nvrm_dpy_rec {
 static struct NvKmsKapiDevice *gDev;
 static struct nvrm_dpy_rec gDpy[NVKMS_KAPI_MAX_CONNECTORS * 2];
 static int gNDpy = -1;
+// How many displays the boot enumeration found. A framebuffer whose display index is >= this exists because a display
+// appeared after boot (hotplugFire adds it to gDpy and re-registers the idle nub), and that instance is the one that
+// has to tell the framework its connection is new -- see connectNotifyFire/enableController.
+static int gNDpyBoot = -1;
 static int gBootHead = -2;
 static NvKmsKapiDisplay gBootDpy = 0;
 static struct NvKmsKapiDisplayMode gBootMode;
@@ -707,6 +763,9 @@ bool NVRMNVDAFramebuffer::kapiInit()
               br[1], rr, matches, matches == 99 ? " (head not in its mask)" : "",
               gBootHead >= 0 ? "RESERVED for display" : "no reservation, display", (unsigned)gBootDpy, gBootHead);
     }
+    // The boot enumeration is done: remember its size. Any framebuffer that starts later (a display plugged in after
+    // boot) has fIndex >= gNDpyBoot, which is how it knows it is the new one.
+    if (gNDpyBoot < 0) gNDpyBoot = gNDpy;
     if (gNDpy <= 0 || fIndex >= (unsigned)gNDpy) {
         FBLOG("index %u: only %d display(s) connected -- nothing to drive, not starting", fIndex, gNDpy);
         return false;
@@ -717,6 +776,26 @@ bool NVRMNVDAFramebuffer::kapiInit()
         if (fInternal) FBLOG("fb%u: display 0x%x is internal -- reporting kIOConnectionBuiltIn", fIndex, fDisplay);
         fEdidSize = (NvU16)(r->edidSize > sizeof fEdid ? sizeof fEdid : r->edidSize);
         nvu_copy(fEdid, r->edid, fEdidSize);
+        nvrmEdidPanelSizeMm(fEdid, fEdidSize, &fEdidMmW, &fEdidMmH);
+        FBLOG("fb%u: EDID %u B, panel %ux%u mm (imageWidth/imageHeight)", fIndex, (unsigned)fEdidSize,
+              (unsigned)fEdidMmW, (unsigned)fEdidMmH);
+        // HDMI/DisplayPort audio: build the sink's ELD from its EDID and publish it with the hda-gfx pairing, the same
+        // two properties AMD and Intel framebuffers expose, so the card's audio function (NMHDA + AppleHDAController)
+        // has the Short Audio Descriptors a codec needs. External connectors only -- an internal eDP panel has no
+        // audio. The connector-type guess is HDMI (the common case and what the reports describe); an HDMI VSDB in the
+        // EDID confirms it, and NVKMS must still enable the audio stream on the head for a codec to actually appear.
+        if (!fInternal && fEdidSize >= 128) {
+            uint8_t eld[NVRM_ELD_MAX];
+            size_t eldn = nvrm_build_eld(fEdid, fEdidSize, NVRM_ELD_CONN_HDMI, eld);
+            if (eldn) {
+                if (OSData *d = OSData::withBytes(eld, (unsigned)eldn)) { setProperty("nvda-eld", d); d->release(); }
+                setProperty("hda-gfx", "onboard-1");
+                FBLOG("fb%u: published %lu-byte ELD and hda-gfx=onboard-1 for display audio",
+                      fIndex, (unsigned long)eldn);
+            } else
+                FBLOG("fb%u: EDID %u B yielded no ELD; no display-audio properties published",
+                      fIndex, (unsigned)fEdidSize);
+        }
         NvU32 avail = r->headMask & ~gHeadsTaken;
         if (gBootHead >= 0) {
             if (fDisplay == gBootDpy && (avail & (1u << gBootHead))) avail = 1u << gBootHead;
@@ -733,14 +812,27 @@ bool NVRMNVDAFramebuffer::kapiInit()
               fIndex, fDisplay, (unsigned)fConnector, (unsigned)r->headMask, fHead,
               (unsigned)gHeadsTaken);
     }
-    bool have = false;
+    // This mode becomes the head's boot raster (fBootW/fBootH below), which decides the scaler and
+    // raster ceilings and which refresh rates addKmsRefreshModes() can publish. A NVKMS-preferred mode
+    // is the EDID native timing and wins outright. When no mode is flagged preferred -- common on a
+    // second monitor, whose head never runs the firmware's console detection -- the largest validated
+    // raster is the panel's native resolution. Taking the first validated mode instead made the boot
+    // raster depend on NVKMS enumeration order: a small raster landing first capped fRasterMaxW below
+    // the native resolution (so its high-refresh modes were never offered) and let the intermediate
+    // rasters flood the mode table, which is why a second high-refresh display came up at 60/75 Hz or
+    // black on some boots and correctly on others. Ties keep the higher pixel clock so the boot mode is
+    // the native raster's top rate.
+    bool have = false; NvU64 bestArea = 0; NvU32 bestClock = 0;
     for (NvU32 i = 0; i < 256; i++) {
         struct NvKmsKapiDisplayMode m = {}; NvBool valid = NV_FALSE, preferred = NV_FALSE;
         int r = fKms->getDisplayMode(fDev, fDisplay, i, &m, &valid, &preferred);
         if (r < 0) break;
         if (r == 0 || !valid) continue;
-        if (!have || preferred) { fMode = m; have = true; }
-        if (preferred) break;
+        if (preferred) { fMode = m; have = true; break; }
+        const NvU64 area = (NvU64)m.timings.hVisible * m.timings.vVisible;
+        if (!have || area > bestArea || (area == bestArea && m.timings.pixelClockHz > bestClock)) {
+            fMode = m; bestArea = area; bestClock = m.timings.pixelClockHz; have = true;
+        }
     }
     if (!have) { FBLOG("no valid mode"); return false; }
     if (gBootHead < 0 && fIndex == 0) fBootConsole = true;
@@ -763,17 +855,9 @@ bool NVRMNVDAFramebuffer::kapiInit()
     fSize = ((NvU64)fPitch * fH + 0xffff) & ~0xffffull;
     {
         fBootMode = fMode; fBootW = fW; fBootH = fH; fBootPitch = fPitch; fRasterW = fW; fRasterH = fH; fPitchAlign = pitchAlign;
-        NvU32 mw = fW * 2 > 3840 ? 3840 : fW * 2, mh = fH * 2 > 2160 ? 2160 : fH * 2;
-        if (mw < fW) mw = fW;
-        if (mh < fH) mh = fH;
-        fScalerMaxW = mw; fScalerMaxH = mh;
-        fRasterMaxW = fW * 2 > 7680 ? 7680 : fW * 2;
-        if (fRasterMaxW < fW) fRasterMaxW = fW;
-        const NvU64 mp_ = ((NvU64)mw * 4 + pitchAlign - 1) & ~((NvU64)pitchAlign - 1);
-        fAllocSize = (mp_ * mh + 0xffff) & ~0xffffull;
-        if (fAllocSize < fSize) fAllocSize = fSize;
+        computeScanoutCaps(pitchAlign);
         FBLOG("fbmodes: boot raster %ux%u pitch %u; scanout allocation sized for %ux%u (%llu KB, boot needs %llu KB)",
-              fW, fH, fPitch, mw, mh, fAllocSize / 1024, fSize / 1024);
+              fW, fH, fPitch, fScalerMaxW, fScalerMaxH, fAllocSize / 1024, fSize / 1024);
     }
     FBLOG("display 0x%x head %u connector 0x%x mode %ux%u @%u pitch %u size %llu KB", fDisplay, fHead, fConnector, fW, fH, fMode.timings.refreshRate, fPitch, fSize / 1024);
     NvU64 consBase = 0, consEnd = 0;
@@ -856,7 +940,15 @@ bool NVRMNVDAFramebuffer::kapiInit()
         } else if (userPhys && userPhys != kernelPhys && verifyAperture(userPhys, "userPhys")) {
             fPhys = userPhys; haveAperture = true;
         }
-        if (haveAperture) { FBLOG("%s ACCEPTED -- aperture 0x%llx", what, fPhys); break; }
+        if (haveAperture) {
+            // Count a video-memory scanout against the BAR1 the accel budget may hand out. A system-memory scanout
+            // does not sit in BAR1, so it is not counted.
+            if (kTryOrder[t] && !fScanoutBarBytes) {
+                fScanoutBarBytes = fMemBytes;
+                OSAddAtomic64((SInt64)fScanoutBarBytes, &gVramDisplayBytes);
+            }
+            FBLOG("%s ACCEPTED -- aperture 0x%llx", what, fPhys); break;
+        }
         FBLOG("%s rejected -- no CPU-writable aperture; freeing and trying the other pool", what);
         if (fKva)      fKms->unmapMemory(fDev, fMem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, fKva);
         if (fUserPhys) fKms->unmapMemory(fDev, fMem, NVKMS_KAPI_MAPPING_TYPE_USER, fUserPhys);
@@ -889,6 +981,7 @@ bool NVRMNVDAFramebuffer::kapiInit()
     fSurf = fKms->createSurface(fDev, &sp);
     if (!fSurf) {
         FBLOG("createSurface failed");
+        if (fScanoutBarBytes) { OSAddAtomic64(-(SInt64)fScanoutBarBytes, &gVramDisplayBytes); fScanoutBarBytes = 0; }
         if (consoleSilenced && getPlatform()) getPlatform()->setConsoleInfo(0, kPEEnableScreen);
         return false;
     }
@@ -1105,6 +1198,22 @@ static NVRMNVDAFramebuffer *gFBs[16];
 // framebuffer; this does the same: the display is added to the table and the idle nubs are matched again, so the next
 // framebuffer starts exactly as it would have at boot with the monitor already on.
 static thread_call_t gHotplug = nullptr;
+// A framebuffer whose display appeared after boot has to tell the framework its connection is new, through the handler
+// the framework registered for kIOFBConnectInterruptType (fConnect). iOService::registerForInterruptType does keep that
+// handler, but nothing ever invoked it: CoreDisplay's connect-change path (IOFBInterestCallback ->
+// IOFBProcessConnectChange) then never runs, CoreGraphics keeps listing the displays it saw at startup, and the new
+// display gets no display pipe. The mode set has to be done first (WindowServer re-probes a framebuffer that has a
+// mode), so this is a delayed call.
+static thread_call_t gConnectNotify = nullptr;
+void NVRMNVDAFramebuffer::connectNotifyFire(thread_call_param_t p0, thread_call_param_t)
+{
+    NVRMNVDAFramebuffer *me = (NVRMNVDAFramebuffer *)p0;
+    if (!me || OSAddAtomic(0, &me->fStopping)) return;
+    if (!me->fConnect.proc) { FBLOG("fb%u connect notify: nothing registered yet", me->fIndex); return; }
+    me->fConnectFired = true;
+    FBLOG("fb%u -> connect interrupt (the framework's registered handler)", me->fIndex);
+    me->fConnect.proc(me->fConnect.target, me->fConnect.ref);
+}
 void NVRMNVDAFramebuffer::hotplugKick()
 {
     if (!gHotplug) return;
@@ -1213,6 +1322,12 @@ static IORecursiveLock *startLock()
     }
     return gL;
 }
+// Flip completion-wait controls, surfaced through the debug.nvrmfb_flip_latch* sysctls registered
+// below. gFlipLatch gates the wait (default 1; 0 is a debug bypass that lets a surface retire before
+// its flip latches, i.e. reintroduces the strobe). The counters report the real wait the compositor
+// path takes, which is what an on-machine flicker check reads.
+static int gFlipLatch = 1;
+static int gFlipLatchWaits = 0, gFlipLatchTimeouts = 0, gFlipLatchMaxUs = 0;
 NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig *cfg,
                                             struct NvKmsKapiModeSetReplyConfig *rep, NvBool commit, bool bootstrap,
                                             bool cursorOnly)
@@ -1273,14 +1388,21 @@ NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig 
     if (!tracked) { fSubmissionSeen = false; return NV_TRUE; }
     fSubmissionSeen = true;
     // Initial acceptance permits console handoff, never surface retirement. The owned boot surface remains pinned.
-    if (bootstrap) return NV_TRUE;
+    if (bootstrap || !gFlipLatch) return NV_TRUE;
+    OSIncrementAtomic((volatile SInt32 *)&gFlipLatchWaits);
+    const uint64_t latch0 = mach_absolute_time();
     for (unsigned i = 0; i < 100; ++i) {
         NvBool pending = NV_TRUE;
         if (!fKms->getFlipPendingStatus(fDev, fHead, NVKMS_KAPI_LAYER_PRIMARY_IDX, &pending)) break;
-        if (!pending) return NV_TRUE;
+        if (!pending) {
+            const int us = (int)((mach_absolute_time() - latch0) / 1000);
+            if (us > gFlipLatchMaxUs) gFlipLatchMaxUs = us;
+            return NV_TRUE;
+        }
         IOSleep(1);
     }
     // Keep both the old front and submitted surface alive until a proven recovery/reboot.
+    OSIncrementAtomic((volatile SInt32 *)&gFlipLatchTimeouts);
     FBLOG("presentation blocked: submitted completion unavailable on head %u", fHead);
     fSubmissionFaulted = true; return NV_FALSE;
 }
@@ -1432,6 +1554,11 @@ bool NVRMNVDAFramebuffer::cursorInit()
         fKms->freeMemory(fDev, fCurMem); fCurMem = nullptr; fCurKva = nullptr; return false;
     }
     fCurDim = dim;
+    // The cursor plane is video memory too, so it counts against the BAR1 the accel budget may use.
+    if (!fCursorBarBytes) {
+        fCursorBarBytes = sz;
+        OSAddAtomic64((SInt64)fCursorBarBytes, &gVramDisplayBytes);
+    }
     FBLOG("cursor plane READY: %ux%u A8R8G8B8 pitch %u (device maxCursorSizeInPixels %u, validCompModes 0x%x)",
           dim, dim, dim * 4, fCurMaxPx, fCurCompModes);
     return true;
@@ -1577,7 +1704,12 @@ uint64_t NVRMNVDAFramebuffer::vblPeriodAbs()
     uint64_t ns = 16666667ull;
     if (t.pixelClockHz && t.hTotal && t.vTotal) {
         const uint64_t q = (uint64_t)t.hTotal * t.vTotal * 1000000000ull / t.pixelClockHz;
-        if (q >= 4000000ull && q <= 50000000ull) ns = q;
+        // 2 ms..50 ms is 500 Hz..20 Hz. When NVKMS refuses the hardware vblank this period paces the
+        // software fallback that drives WindowServer, so the window has to reach the real panel rate:
+        // a 4 ms floor (250 Hz) dropped 280/300/360 Hz panels back to the 60 Hz default and the frame
+        // delivery beat against the scan-out. A sub-2 ms period only comes from an implausible pixel
+        // clock, so it still falls back to 60 Hz rather than spinning the timer.
+        if (q >= 2000000ull && q <= 50000000ull) ns = q;
     }
     uint64_t abs = 0; nanoseconds_to_absolutetime(ns, &abs); return abs;
 }
@@ -1724,13 +1856,17 @@ static void nvrmDiscoverBar1(IOService *provider, NvU64 *length, NvU64 *base)
     *length = 0; *base = 0;
     for (IOService *nub = provider; nub; nub = nub->getProvider()) {
         if (!nub->metaCast("IOPCIDevice")) continue;
+        // BAR1 is the largest range after BAR0 (the registers). WAS: the first range of at least 256 MB, so a 64 or
+        // 128 MB BAR1 read as 0 and got the budget and park ceiling of an unknown window.
         const IOItemCount count = nub->getDeviceMemoryCount();
-        for (IOItemCount i = 0; i < count; i++) {
+        IOMemoryDescriptor *best = nullptr;
+        for (IOItemCount i = 1; i < count; i++) {
             IOMemoryDescriptor *memory = nub->getDeviceMemoryWithIndex(i);
-            if (!memory || memory->getLength() < 0x10000000ull) continue;
-            *length = memory->getLength();
-            *base = memory->getPhysicalSegment(0, 0, kIOMemoryMapperNone);
-            return;
+            if (memory && memory->getLength() >= (32ull << 20) && (!best || memory->getLength() > best->getLength())) best = memory;
+        }
+        if (best) {
+            *length = best->getLength();
+            *base = best->getPhysicalSegment(0, 0, kIOMemoryMapperNone);
         }
         return;
     }
@@ -1762,6 +1898,12 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
         if (gFBs[fIndex] != this) { retain(); if (gFBs[fIndex]) gFBs[fIndex]->release(); gFBs[fIndex] = this; }
         if (sl) IORecursiveLockUnlock(sl);
     }
+    // A display index at or past the boot enumeration means this display appeared after boot (hotplugFire added it to
+    // gDpy and re-registered the idle nub). Such an instance has to fire the framework's connect handler once its head
+    // has a mode -- see connectNotifyFire and enableController.
+    fHotplugBorn = (gNDpyBoot >= 0 && (int)fIndex >= gNDpyBoot);
+    if (fHotplugBorn && !gConnectNotify) gConnectNotify = thread_call_allocate(connectNotifyFire, nullptr);
+    if (fHotplugBorn) FBLOG("fb%u: a display appeared after boot -- the connect interrupt will be fired once the head has a mode", fIndex);
     fPhysForVa = (nvrm_phys_for_va_t)(uintptr_t)propU64(provider, "phys-for-va");
     if (!fKms || !fPhysForVa || !fKms->getFlipPendingStatus || !fKms->dupMemory) { FBLOG("nub lacks nvkms-kapi/phys-for-va properties"); return false; }
     setProperty("IOFBDependentID", (unsigned long long)0x4E56524D00000001ull, 64);
@@ -1901,7 +2043,16 @@ void NVRMNVDAFramebuffer::free()
 IOReturn NVRMNVDAFramebuffer::enableController()
 {
     FBLOG("enableController");
-    return applyMode() ? kIOReturnSuccess : kIOReturnError;
+    const bool ok = applyMode();
+    // A display that appeared after boot: tell the framework, through the connect handler it registered (fConnect),
+    // that this connection is new. It has to happen after the mode set -- WindowServer re-probes a framebuffer that
+    // has a mode, and firing it earlier leaves the display undetected -- so it is a delayed call.
+    if (ok && fHotplugBorn && !fConnectFired && gConnectNotify) {
+        uint64_t d; clock_interval_to_deadline(1500, kMillisecondScale, &d);
+        thread_call_enter1_delayed(gConnectNotify, this, d);
+        FBLOG("fb%u: connect interrupt scheduled (1.5 s after the mode set)", fIndex);
+    }
+    return ok ? kIOReturnSuccess : kIOReturnError;
 }
 IOReturn NVRMNVDAFramebuffer::setDisplayMode(IODisplayModeID mode, IOIndex depth)
 {
@@ -1951,6 +2102,41 @@ bool NVRMNVDAFramebuffer::edidModeFor(const IODetailedTimingInformationV2 *d, st
         return true;
     }
     return false;
+}
+// The scanout allocation, and the scaler and raster ceilings that gate which modes reach the user, have to cover the
+// LARGEST raster this panel can drive -- a HiDPI desktop is backed by a surface the full size of the raster it sits on,
+// and an unscaled native raster is scanned out of a surface its own size. Sizing those from the boot raster (the old
+// 2x-boot, capped at 3840x2160 / 7680 wide) stranded every panel whose native raster was wider or taller than twice the
+// mode the firmware happened to light: a 32:9 ultrawide (5120x1440, 7680x2160) that booted at 1920x1080 or 2560x1440 was
+// capped at 3840 wide and offered only 16:9 rasters, and 5K/6K panels lost their native height. The ceilings now follow
+// the panel's own NVKMS-validated mode list, bounded by the 8K scanout limit; the boot raster is the floor, and the
+// 2x-boot heuristic is kept only as a fallback when the mode list reports nothing (so a panel with an unreadable mode
+// list still gets one scaled step up). A size NVRAM/BAR cannot satisfy is retried smaller by the allocation loop.
+void NVRMNVDAFramebuffer::computeScanoutCaps(NvU32 pitchAlign)
+{
+    NvU32 pmw = 0, pmh = 0;
+    if (fKms && fDev && fDisplay) {
+        for (NvU32 i = 0; i < 256; i++) {
+            struct NvKmsKapiDisplayMode m = {}; NvBool valid = NV_FALSE, pref = NV_FALSE;
+            int r = fKms->getDisplayMode(fDev, fDisplay, i, &m, &valid, &pref);
+            if (r < 0) break;
+            if (r == 0 || !valid) continue;
+            const struct NvKmsKapiDisplayModeTimings &k = m.timings;
+            if (k.flags.interlaced || k.flags.doubleScan || !k.pixelClockHz) continue;
+            if (k.hVisible > pmw) pmw = k.hVisible;
+            if (k.vVisible > pmh) pmh = k.vVisible;
+        }
+    }
+    NvU32 mw = pmw ? pmw : fW * 2;   // the panel's widest validated raster, or one step up when the list is empty
+    NvU32 mh = pmh ? pmh : fH * 2;
+    if (mw < fW) mw = fW;
+    if (mh < fH) mh = fH;
+    if (mw > 7680) mw = 7680;        // Blackwell/Ada scanout ceiling; above this NVKMS validates nothing anyway
+    if (mh > 4320) mh = 4320;
+    fScalerMaxW = mw; fScalerMaxH = mh; fRasterMaxW = mw;
+    const NvU64 mp_ = ((NvU64)mw * 4 + pitchAlign - 1) & ~((NvU64)pitchAlign - 1);
+    fAllocSize = (mp_ * mh + 0xffff) & ~0xffffull;
+    if (fAllocSize < fSize) fAllocSize = fSize;
 }
 // Users on HDMI and DisplayPort (RTX 3050/3060/4060, 144-240 Hz panels) saw only 60 Hz: macOS's EDID parse handed
 // validateDetailedTiming nothing above 60 Hz for those panels, while NVKMS parses the same EDID (CTA-861 and DisplayID
@@ -2230,6 +2416,7 @@ IOReturn NVRMNVDAFramebuffer::getInformationForDisplayMode(IODisplayModeID mode,
         info->maxDepthIndex = 0;
         info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | (scaled ? kDisplayModeNotPresetFlag : 0);
         if (!scaled && d.horizontalActive == fBootW && d.verticalActive == fBootH) info->flags |= kDisplayModeNativeFlag;
+        info->imageWidth = fEdidMmW; info->imageHeight = fEdidMmH;
         return kIOReturnSuccess;
     }
     nvu_zero(info, sizeof *info);
@@ -2237,6 +2424,7 @@ IOReturn NVRMNVDAFramebuffer::getInformationForDisplayMode(IODisplayModeID mode,
     const NvU32 rr = fBootW ? fBootMode.timings.refreshRate : fMode.timings.refreshRate;
     info->refreshRate = rr ? (UInt32)(((UInt64)rr << 16) / 1000) : (60u << 16);
     info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
+    info->imageWidth = fEdidMmW; info->imageHeight = fEdidMmH;
     return kIOReturnSuccess;
 }
 IOReturn NVRMNVDAFramebuffer::getTimingInfoForDisplayMode(IODisplayModeID mode, IOTimingInformation *info)
@@ -2359,6 +2547,13 @@ static volatile SInt64 gVramMappedBytes = 0;
 // 25 MB, so the last MB could never be parked and every allocation landing there was refused, about once a second
 // (issue #28). 64 MB / 64 slots covers a 5K console (59 MB).
 #define NVRM_VRAM_PARK_CEILING (64ull * 1024ull * 1024ull)
+// A 256 MB BAR1 cannot spare 64 MB of parked mappings (surfaces were refused and the screen stayed black with a cursor).
+// 32 MB still covers a 2560x1440 console (25 MB, issue #28). Larger BAR1s keep 64 MB, enough for a 5K console.
+static inline SInt64 nvrmParkCeiling(NvU64 barLen)
+{
+    if (barLen && barLen < (256ull << 20)) return (SInt64)(barLen / 4);   // 64 MB BAR1: 16 MB, not half the window
+    return (SInt64)(barLen && barLen < (1ull << 30) ? 32ull * 1024ull * 1024ull : NVRM_VRAM_PARK_CEILING);
+}
 static struct { struct NvKmsKapiMemory *m; void *k; NvU64 n; } gParkedForever[64];
 static int      gNParkedForever   = 0;
 static volatile SInt64 gVramParkedBytes = 0;
@@ -2370,6 +2565,8 @@ SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_release_bytes, CTLFLAG_RD | CTLFLAG_LO
 static volatile SInt64 gVramBudgetBytes = 0;
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_budget_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramBudgetBytes, "the BAR1 grant budget in force");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_mapped_bytes,  CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramMappedBytes,  "the BAR1 budget counter, live");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_display_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramDisplayBytes, "scanout+cursor the framebuffer itself maps into BAR1");
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vram_display_aware, CTLFLAG_RW | CTLFLAG_LOCKED, &gVramDisplayAware, 0, "1 = the accel budget reserves the BAR1 the display holds; 0 = the old fixed fraction");
 static struct NVRMVramRequest gVramTest[256]; static int gVramTestN; static int gVramTestMode;
 static int nvrmfb_vramtest_sysctl SYSCTL_HANDLER_ARGS
 {
@@ -2395,12 +2592,11 @@ SYSCTL_PROC(_debug, OID_AUTO, nvrmfb_vramtest, CTLTYPE_INT | CTLFLAG_RW | CTLFLA
             "grant N x 8 MB of VRAM through vramGrant (0 = release all)");
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vramtest_mode, CTLFLAG_RW | CTLFLAG_LOCKED, &gVramTestMode, 0, "1 = release without the kernel unmap");
 static int gFlipInterval = 1;
-static int gFlipLatch = 1;
-SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch, CTLFLAG_RW | CTLFLAG_LOCKED, &gFlipLatch, 0, "fliplatch: pure flip waits for FLIP_OCCURRED");
-static int gFlipLatchWaits = 0, gFlipLatchTimeouts = 0, gFlipLatchMaxUs = 0, gFlipLatchRun = 0;
-SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch_waits, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipLatchWaits, 0, "pure flips that waited for the latch");
-SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch_timeouts, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipLatchTimeouts, 0, "pure flips whose FLIP_OCCURRED never came within 50 ms");
-SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipLatchMaxUs, 0, "longest accept-to-latch wait (us)");
+// gFlipLatch and the counters are defined above submitConfig, where the completion wait drives them.
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch, CTLFLAG_RW | CTLFLAG_LOCKED, &gFlipLatch, 0, "1 = a committed flip waits for its completion before a surface retires (0 = debug bypass)");
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch_waits, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipLatchWaits, 0, "flips that waited for completion");
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch_timeouts, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipLatchTimeouts, 0, "flips whose completion never arrived within the wait");
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipLatchMaxUs, 0, "longest submit-to-completion wait (us)");
 static int gFlipLean = 1;
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_lean, CTLFLAG_RW | CTLFLAG_LOCKED, &gFlipLean, 0, "1 = lean pure flip (surface only)");
 static SInt64 gFlipUsSum, gFlipN, gFlipUsMax;
@@ -2415,6 +2611,7 @@ static void nvrmfbInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_grants);   sysctl_register_oid(&sysctl__debug_nvrmfb_vram_grant_bytes);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_releases); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_release_bytes);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_mapped_bytes); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_budget_bytes);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_vram_display_bytes); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_display_aware);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vramtest); sysctl_register_oid(&sysctl__debug_nvrmfb_vramtest_mode);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_interval); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_us_sum);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_n); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_us_max);
@@ -2432,13 +2629,11 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
     NvU64 want = (r->size + 0xFFFFull) & ~0xFFFFull;
     if (!want) return false;
 
-    const SInt64 budget = (SInt64)nvrmVramBudget(fBarLen);
+    const SInt64 budget = (SInt64)nvrmSurfaceBudget(fBarLen, gVramDisplayBytes);
     gVramBudgetBytes = budget;
-    // Parked blocks hold VRAM but no BAR1 mapping (unmapped when parked), so they no longer count here. WAS: parked bytes
-    // counted against the budget; 1.14 raised the park ceiling from 24 to 64 MB, and on a 256 MB BAR1 (every GTX 16,
-    // boards without Resizable BAR) surfaces were left as little as 128 MB of the 192 MB budget: GTX 16 reports on
-    // 1.14.x logged 24 to 1062 "BAR1 budget spent" refusals and black screens with a cursor; on 1.13, 0 on five of six.
-    SInt64 before = OSAddAtomic64((SInt64)want, &gVramMappedBytes);
+    // Parked blocks keep their BAR1 mapping (see below), so they count against the budget. On a 256 MB BAR1 (every
+    // GTX 16, boards without Resizable BAR) the park ceiling is the smaller one, so surfaces keep most of the budget.
+    SInt64 before = OSAddAtomic64((SInt64)want, &gVramMappedBytes) + gVramParkedBytes;
     if (before + (SInt64)want > budget) {
         OSAddAtomic64(-(SInt64)want, &gVramMappedBytes);
         FBLOG("nvAllocVram(%llu): REFUSED — BAR1 budget spent (%lld of %llu bytes). "
@@ -2458,32 +2653,80 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
         mp.useVideoMemory = NV_TRUE;
         mp.compressible   = &compressible;
         struct NvKmsKapiMemory *m = fKms->allocateMemory(fDev, &mp);
-        if (!m) { FBLOG("nvAllocVram(%llu): allocateMemory failed", (unsigned long long)want); break; }
+        // Both failures print what the budget counted at that moment: the real BAR1 limit of a 256 MB window is
+        // somewhere under the budget, and only these lines can show where.
+        if (!m) { FBLOG("nvAllocVram(%llu): allocateMemory failed (mapped %lld + parked %lld of %lld budget, BAR1 %llu)",
+                        (unsigned long long)want, (long long)gVramMappedBytes, (long long)gVramParkedBytes, (long long)budget,
+                        (unsigned long long)fBarLen); break; }
         void *k = nullptr;
         if (!fKms->mapMemory(fDev, m, NVKMS_KAPI_MAPPING_TYPE_KERNEL, &k) || !k) {
-            FBLOG("nvAllocVram(%llu): mapMemory(KERNEL) failed", (unsigned long long)want);
+            FBLOG("nvAllocVram(%llu): mapMemory(KERNEL) failed (mapped %lld + parked %lld of %lld budget, BAR1 %llu)",
+                  (unsigned long long)want, (long long)gVramMappedBytes, (long long)gVramParkedBytes, (long long)budget,
+                  (unsigned long long)fBarLen);
             fKms->freeMemory(fDev, m); break;
         }
         NvU64 p = fPhysForVa ? fPhysForVa(k) : 0;
         bool onScanout = p && fPhys  && fSize     && p < (fPhys + fSize)         && (p + want) > fPhys;
         bool onConsole = p && fConsPhys && fConsSize && p < (fConsPhys + fConsSize) && (p + want) > fConsPhys;
-        if (!p || onScanout || onConsole) {
+        if (!p) {
+            // No physical address means RM's mapping table could not record this mapping. Parking it would hold one
+            // more mapping per attempt and the next attempt fails the same way: release it and refuse this request.
+            FBLOG("nvAllocVram(%llu): attempt %d has no physical address — released, request refused (RM mapping table full?)",
+                  (unsigned long long)want, attempt);
+            fKms->unmapMemory(fDev, m, NVKMS_KAPI_MAPPING_TYPE_KERNEL, k); fKms->freeMemory(fDev, m);
+            break;
+        }
+        if (onScanout || onConsole) {
             FBLOG("nvAllocVram: attempt %d phys 0x%llx %s — parking it and rolling again",
                   attempt, (unsigned long long)p,
                   !p ? "has no physical address" : onScanout ? "OVERLAPS THE SCANOUT" : "OVERLAPS THE CONSOLE");
             if (gNParkedForever < (int)(sizeof gParkedForever / sizeof gParkedForever[0]) &&
-                gVramParkedBytes + (SInt64)want <= (SInt64)NVRM_VRAM_PARK_CEILING) {
-                // kept allocated so NVKMS cannot place a surface there again, but unmapped: nothing ever reads it
-                fKms->unmapMemory(fDev, m, NVKMS_KAPI_MAPPING_TYPE_KERNEL, k);
+                gVramParkedBytes + (SInt64)want <= nvrmParkCeiling(fBarLen)) {
+                // kept allocated AND mapped: the overlap is judged by the BAR1 address of this mapping, so unmapping
+                // it hands that address straight back and the next allocation lands on the console again (one machine
+                // logged the same address 600 times, every attempt refused: black screen with a cursor)
                 gParkedForever[gNParkedForever].m = m;
-                gParkedForever[gNParkedForever].k = nullptr;
+                gParkedForever[gNParkedForever].k = k;
                 gParkedForever[gNParkedForever].n = want;
                 gNParkedForever++;
                 OSAddAtomic64((SInt64)want, &gVramParkedBytes);
             } else {
-                FBLOG("nvAllocVram: park ceiling reached (%lld bytes over %d slots) — releasing the reject",
-                      (long long)gVramParkedBytes, gNParkedForever);
                 fKms->unmapMemory(fDev, m, NVKMS_KAPI_MAPPING_TYPE_KERNEL, k); fKms->freeMemory(fDev, m);
+                // A surface larger than the park ceiling (a 3840x2560 desktop is 37.5 MB, the ceiling on a 256 MB BAR1
+                // is 32 MB) was never parked, so the same address came back on every attempt. Hold only the part of
+                // the range that overlaps instead: a guard block from this address to the end of the console or
+                // scanout, which the allocator hands out at the address just freed.
+                const NvU64 rEnd = onScanout ? fPhys + fSize : fConsPhys + fConsSize;
+                const NvU64 g = (p && rEnd > p) ? ((rEnd - p) + 0x1FFFFFull) & ~0x1FFFFFull : 0;
+                bool guarded = false;
+                if (g && g < want && gNParkedForever < (int)(sizeof gParkedForever / sizeof gParkedForever[0]) &&
+                    gVramParkedBytes + (SInt64)g <= nvrmParkCeiling(fBarLen)) {
+                    struct NvKmsKapiAllocateMemoryParams gp; nvu_zero(&gp, sizeof gp);
+                    NvU8 gc = 0;
+                    gp.layout = NvKmsSurfaceMemoryLayoutPitch; gp.type = NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT;
+                    gp.size = g; gp.useVideoMemory = NV_TRUE; gp.compressible = &gc;
+                    struct NvKmsKapiMemory *gm = fKms->allocateMemory(fDev, &gp);
+                    void *gk = nullptr;
+                    if (gm && fKms->mapMemory(fDev, gm, NVKMS_KAPI_MAPPING_TYPE_KERNEL, &gk) && gk) {
+                        const NvU64 gpa = fPhysForVa ? fPhysForVa(gk) : 0;
+                        const NvU64 rStart = onScanout ? fPhys : fConsPhys;
+                        if (gpa && gpa < rEnd && gpa + g > rStart) {
+                            gParkedForever[gNParkedForever].m = gm;
+                            gParkedForever[gNParkedForever].k = gk;
+                            gParkedForever[gNParkedForever].n = g;
+                            gNParkedForever++;
+                            OSAddAtomic64((SInt64)g, &gVramParkedBytes);
+                            guarded = true;
+                        } else {
+                            fKms->unmapMemory(fDev, gm, NVKMS_KAPI_MAPPING_TYPE_KERNEL, gk); fKms->freeMemory(fDev, gm);
+                        }
+                    } else if (gm) {
+                        fKms->freeMemory(fDev, gm);
+                    }
+                }
+                FBLOG("nvAllocVram: %llu bytes cannot be parked (%lld bytes parked over %d slots) — %s",
+                      (unsigned long long)want, (long long)gVramParkedBytes, gNParkedForever,
+                      guarded ? "holding a guard block over the overlap instead" : "released, no guard block placed");
             }
             continue;
         }
@@ -2632,9 +2875,13 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
     const bool cacheable = mem && epoch != (UInt64)kFlipEpochLimit;
     if (cacheable) {
         IOInterruptState state = IOSimpleLockLockDisableInterrupt(fFlipCacheLock);
+        // The epoch is part of the match. The key is the NvKmsKapiMemory pointer, which a buffer allocated after a free
+        // can reuse at the same address; matching an entry recorded in an older epoch would scan out its stale surface
+        // over the reallocated memory, which strobes the panel black every other frame after a refresh or resolution
+        // change. Requiring the current epoch makes a reused address always take a fresh surface.
         for (unsigned i = 0; i < fFlipCacheN; i++)
-            if (fFlipCache[i].cookie == cookie && fFlipCache[i].mem == mem && fFlipCache[i].pitch == pitch &&
-                fFlipCache[i].w == w && fFlipCache[i].h == h) { surf = fFlipCache[i].surf; break; }
+            if (fFlipCache[i].epoch == epoch && fFlipCache[i].cookie == cookie && fFlipCache[i].mem == mem &&
+                fFlipCache[i].pitch == pitch && fFlipCache[i].w == w && fFlipCache[i].h == h) { surf = fFlipCache[i].surf; break; }
         IOSimpleLockUnlockEnableInterrupt(fFlipCacheLock, state);
     }
     if (!surf) {

@@ -43,7 +43,7 @@ KNOBS=(); PROFILE=""; COLLECT=""; UPD=""; VERB=""; PKG=""; SHA=""; CFG=""; EFI=a
 while [ $# -gt 0 ]; do case "$1" in
   --pkg) PKG=$2; shift;; --sha) SHA=$2; shift;; --config) CFG=$2; shift;; --efi) EFI=$2; shift;;
   --tool) TOOL=$2; shift;; --usbmap) USBMAP=$2; shift;; --app) APPBIN=$2; shift;; --dry) DRY=1;; --remove) REMOVE=1;; --verbose) VERB=$2; shift;; --update) UPD=$2; shift;; --collect-logs) COLLECT=$2; shift;;
-  --knob) KNOBS+=("$2"); shift;; --profile) PROFILE=$2; shift;; --logo) LOGO=$2; shift;; --set-logo) SETLOGO=$2; shift;; --gpu-test) GPUTEST=$2; shift;;
+  --knob) KNOBS+=("$2"); shift;; --profile) PROFILE=$2; shift;; --logo) LOGO=$2; shift;; --set-logo) SETLOGO=$2; shift;; --gpu-test) GPUTEST=$2; shift;; --backlight) BACKLIGHT=$2; shift;;
   *) echo "STOP unknown option $1"; echo "RESULT stop"; exit 2;; esac; shift; done
 step() { echo "STEP $*"; }; ok() { echo "OK $*"; }; note() { echo "NOTE $*"; }
 KT=""
@@ -656,7 +656,7 @@ fi
 INSTALL_THEN_PREPARE=0; [ "$UPD" = prepare ] && [ -n "$PKG" ] && INSTALL_THEN_PREPARE=1
 # the app's boot-logo and test-driver switches run setup without a package; 1.14 sent them through the package check
 # ("STOP package not found:", 4 uploads in the first hour of 1.14), so neither switch worked
-if [ -z "$USBMAP" ] && [ -z "$VERB" ] && [ -z "${SETLOGO:-}" ] && [ -z "${GPUTEST:-}" ] && { [ -z "$UPD" ] || [ $INSTALL_THEN_PREPARE = 1 ]; }; then
+if [ -z "$USBMAP" ] && [ -z "$VERB" ] && [ -z "${SETLOGO:-}" ] && [ -z "${GPUTEST:-}" ] && [ -z "${BACKLIGHT:-}" ] && { [ -z "$UPD" ] || [ $INSTALL_THEN_PREPARE = 1 ]; }; then
 step "Checking the driver package"
 [ -f "$PKG" ] || stop "package not found: $PKG"
 # the app's copy is writable by the user: hash and unpack a root-owned copy, so it cannot be swapped after the check
@@ -856,6 +856,24 @@ if [ -n "${SETLOGO:-}" ]; then
   ok "boot logo $SETLOGO - takes effect at the next restart"; cleanup; echo "RESULT ok"; exit 0
 fi
 
+if [ -n "${BACKLIGHT:-}" ]; then
+  # The app's "Built-in screen brightness": boot-arg nvrmacpibl=1 lets RM read the laptop panel's backlight through the
+  # GPU's ACPI _DSM. It stays opt-in because that call hung GPU start on some PCs in 1.14; if it does, the boot picker's
+  # "Start once without NVIDIA driver" entry starts macOS without the driver so this can be turned off again.
+  case "$BACKLIGHT" in on|off) ;; *) stop "--backlight takes on or off";; esac
+  step "Turning built-in screen brightness $BACKLIGHT"
+  BKC="$C.nullmoth-backlight-$(date +%Y%m%d-%H%M%S)"; cp -p "$C" "$BKC" || stop "could not back up $C$(ro_why "$C")"
+  new=""; for a in $(get NVRAM.Add.$B.boot-args); do [ "$a" = nvrmacpibl=1 ] || new="$new $a"; done
+  [ "$BACKLIGHT" = on ] && new="$new nvrmacpibl=1"; new=${new# }
+  if has NVRAM.Add.$B.boot-args; then plutil -replace NVRAM.Add.$B.boot-args -string "$new" "$C"
+  else plutil -insert NVRAM.Add.$B.boot-args -string "$new" "$C"; fi
+  plutil -lint "$C" >/dev/null || { cp -p "$BKC" "$C"; stop "editing the config failed - the original is restored"; }
+  nv=""; for a in $(nvram boot-args 2>/dev/null | cut -f2-); do [ "$a" = nvrmacpibl=1 ] || nv="$nv $a"; done
+  [ "$BACKLIGHT" = on ] && nv="$nv nvrmacpibl=1"
+  nvram boot-args="${nv# }" || note "could not write NVRAM boot-args; the config change still applies"
+  ok "built-in screen brightness $BACKLIGHT - takes effect at the next restart"; cleanup; echo "RESULT ok"; exit 0
+fi
+
 if [ -n "${GPUTEST:-}" ]; then
   # The app's "AMD / Intel GPU driver (test)": NMXGPU (amdgpu, i915 and xe for macOS) for the AMD and Intel GPUs this Mac
   # has, opt-in per vendor with nmxamd=1 / nmxintel=1. On: the GPU firmware from linux-firmware at the commit the
@@ -892,9 +910,47 @@ if [ -n "${GPUTEST:-}" ]; then
     kmutil create -n aux --volume-root / "${KA[@]}" -B /System/Library/KernelCollections/BootKernelExtensions.kc \
       -S /System/Library/KernelCollections/SystemKernelExtensions.kc --repository "$EXT" \
       -A /Library/KernelCollections/AuxiliaryKernelExtensions.kc -z > "$ST/gputest-kmutil.log" 2>&1; }
+  # An Intel GPU switched off in OpenCore (disable-gpu on the iGPU, or -wegnoigpu) is not on macOS's PCI list at all:
+  # Lilu terminates its PCI device (DeviceInfo::processSwitchOff), so the scan above finds nothing, and 2.0.3 stopped with
+  # "no AMD or Intel GPU" on a Core Ultra laptop whose only GPU it was (chat photo 10-16). The test driver needs that GPU
+  # on, so "on" turns it back on (applied below, once the kernel collection took the driver) and records what it took
+  # out in $REEN, and "off" puts exactly that back.
+  # The CPU's own GPU: Intel's at 00:02.0; AMD's APU GPU (Raven Ridge and later, Steam Deck included) behind the internal
+  # bridge 00:08.1. It is looked for whenever that vendor's GPU is not visible, even when an NPU is: the Core Ultra 135U
+  # in the 10-16 photo has an NPU, and an "anything found" test would have installed the NPU driver and left the GPU off.
+  REEN=/Library/NullMoth/gputest-reenabled; IGOFF=""
+  case "$(sysctl -n machdep.cpu.vendor 2>/dev/null)" in
+    GenuineIntel) IGPU="PciRoot(0x0)/Pci(0x2,0x0)"; IGV=8086; IGW=-nmxintel; IGN=Intel;;
+    AuthenticAMD) IGPU="PciRoot(0x0)/Pci(0x8,0x1)/Pci(0x0,0x0)"; IGV=1002; IGW=-nmxamd; IGN=AMD;;
+    *) IGPU=""; IGV=""; IGW=""; IGN="";;
+  esac
+  if [ "$GPUTEST" = on ] && [ -n "$IGV" ] && ! echo " $VENDORS " | grep -q " $IGV "; then
+    has "DeviceProperties.Add.$IGPU.disable-gpu" && IGOFF="disable-gpu"
+    # -wegnoigpu (WhateverGreen) switches off Intel's built-in GPU only
+    [ "$IGV" = 8086 ] && for a in $(get NVRAM.Add.$B.boot-args) $(nvram boot-args 2>/dev/null | cut -f2-); do [ "$a" = -wegnoigpu ] && IGOFF="$IGOFF -wegnoigpu"; done
+    IGOFF=$(echo $IGOFF | tr ' ' '\n' | sort -u | tr '\n' ' '); IGOFF=${IGOFF% }
+    if [ -n "$IGOFF" ]; then VENDORS="$VENDORS $IGV"; WANT="$WANT $IGW"; note "the $IGN GPU is switched off in OpenCore ($IGOFF): it is turned back on for the test driver"; fi
+  fi
   if [ "$GPUTEST" = on ]; then
-    [ -n "$WANT" ] || stop "this Mac has no AMD or Intel GPU for this driver"
-    [ -d "$GK" ] || stop "this driver package has no AMD/Intel GPU driver (NMXGPU) - update the driver first"
+    [ -n "$WANT" ] || stop "this Mac has no AMD or Intel GPU for this driver (none is on macOS's PCI list, and no disable-gpu on ${IGPU:-the processor GPU} in OpenCore to undo)"
+    # A Mac with only an AMD or Intel GPU never ran the NVIDIA install (it stops at "no NVIDIA GPU"), so the test driver
+    # was never on disk and this switch could not work for the very Macs it is for. The app passes the downloaded,
+    # checksum-verified package: its AMD/Intel kexts, GPU userland and NPU files are taken from a root-owned copy.
+    if [ ! -d "$GK" ] && [ -n "$PKG" ] && [ -n "$SHA" ] && [ -f "$PKG" ]; then
+      step "Taking the AMD/Intel test driver from the downloaded package"
+      PKGDIR=$(mktemp -d /var/tmp/nullmoth-pkg.XXXX) || stop "could not make a folder to check the package in"
+      cp "$PKG" "$PKGDIR/" || stop "could not copy the package for checking"
+      PK=$PKGDIR/$(basename "$PKG")
+      [ "$(shasum -a 256 "$PK" | awk '{print $1}')" = "$SHA" ] || stop "package checksum does not match - download it again"
+      tar -xzf "$PK" -C "$PKGDIR" || stop "could not unpack the package"
+      PR="$PKGDIR/pkgroot"; (cd "$PR" && shasum -a 256 -c SHA256SUMS --quiet) || stop "the package's files do not match its SHA256SUMS"
+      [ -d "$PR/Library/NullMoth/kexts/$KMAJ/NMXGPU.kext" ] || stop "this driver package has no AMD/Intel GPU driver for macOS $KMAJ"
+      mkdir -p /Library/NullMoth
+      for d in kexts gpu-userland npu; do [ ! -d "$PR/Library/NullMoth/$d" ] || ditto "$PR/Library/NullMoth/$d" "/Library/NullMoth/$d" || stop "could not copy $d"; done
+      chown -R root:wheel /Library/NullMoth/kexts && chmod -R go-w /Library/NullMoth/kexts
+      ok "AMD/Intel test driver taken from the package (no NVIDIA driver installed)"
+    fi
+    [ -d "$GK" ] || stop "this driver package has no AMD/Intel GPU driver (NMXGPU) - download the driver package first"
     [ -f "$MAN" ] || stop "this copy of the app has no GPU firmware list"
     step "Downloading the GPU firmware (linux-firmware, every file checked)"
     COMMIT=$(awk 'NR==2{print}' "$MAN" | grep -oE 'raw/[0-9a-f]{40}' | cut -d/ -f2); [ -n "$COMMIT" ] || stop "the GPU firmware list names no commit"
@@ -976,11 +1032,31 @@ if [ -n "${GPUTEST:-}" ]; then
       rm -rf "$EXT/NMXGPU.kext" "$EXT/NMXAccel.kext" "$EXT/NMXNPU.kext"; auxkc; cp -p "$BKC" "$C"; stop "the kernel collection did not take NMXGPU/NMXAccel/NMXNPU (log: $ST/gputest-kmutil.log) - removed again"
     fi
     for a in $WANT; do ga add "${a#-}=1"; done
+    if [ -n "$IGOFF" ]; then
+      mkdir -p /Library/NullMoth && : > "$REEN" || stop "cannot record the Intel GPU settings in $REEN"
+      if [ "${IGOFF#*disable-gpu}" != "$IGOFF" ]; then   # the value as it was (data or bool), for "off" to put back
+        plutil -extract "DeviceProperties.Add.$IGPU.disable-gpu" xml1 -o - "$C" | sed -n '/<plist/,/<\/plist>/p' | sed '1d;$d' > "$REEN.value" \
+          && [ -s "$REEN.value" ] && plutil -remove "DeviceProperties.Add.$IGPU.disable-gpu" "$C" && echo disable-gpu >> "$REEN" \
+          || { cp -p "$BKC" "$C"; stop "could not take disable-gpu off the $IGN GPU - the original config is restored"; }
+      fi
+      [ "${IGOFF#*-wegnoigpu}" != "$IGOFF" ] && { ga del -wegnoigpu; echo -wegnoigpu >> "$REEN"; }
+      ok "$IGN GPU turned back on in OpenCore ($(tr '\n' ' ' < "$REEN"| sed 's/ $//') removed; Turn it off puts it back)"
+    fi
     # the drivers' boot guards: an attach that never returned parks the driver until on/off clears this
     nvram -d nullmoth-npu-attaching 2>/dev/null; nvram -d nullmoth-gpu-attaching 2>/dev/null
   else
     step "Removing the AMD/Intel GPU driver"
     ga del nmxamd=1; ga del nmxintel=1; ga del nmxnpu=1
+    # an Intel or AMD GPU that "on" turned back on goes back off exactly as it was
+    if [ -f "$REEN" ]; then
+      if grep -qx disable-gpu "$REEN" && [ -s "$REEN.value" ] && ! has "DeviceProperties.Add.$IGPU.disable-gpu"; then
+        has "DeviceProperties.Add.$IGPU" || plutil -insert "DeviceProperties.Add.$IGPU" -dictionary "$C"
+        plutil -insert "DeviceProperties.Add.$IGPU.disable-gpu" -xml "$(cat "$REEN.value")" "$C" || note "could not put disable-gpu back on the $IGN GPU"
+      fi
+      grep -qx -- -wegnoigpu "$REEN" && ga add -wegnoigpu
+      ok "$IGN GPU switched off in OpenCore again, as it was before the test driver ($(tr '\n' ' ' < "$REEN" | sed 's/ $//'))"
+      rm -f "$REEN" "$REEN.value"
+    fi
     nvram -d nullmoth-npu-attaching 2>/dev/null; nvram -d nullmoth-gpu-attaching 2>/dev/null
     if [ -d "$EXT/NMXGPU.kext" ] || [ -d "$EXT/NMXAccel.kext" ] || [ -d "$EXT/NMXNPU.kext" ]; then
       rm -rf "$EXT/NMXGPU.kext" "$EXT/NMXAccel.kext" "$EXT/NMXNPU.kext" && auxkc || note "the kernel collection rebuild reported an error (log: $ST/gputest-kmutil.log)"
@@ -1028,7 +1104,10 @@ if [ -n "$UPD" ]; then
     bi=$(bidx); [ -n "$bi" ] && plutil -replace Kernel.Block.$bi.Enabled -bool false "$C"
     args_set add -nvoff
     plutil -lint "$C" >/dev/null || { cp -p "$BKC" "$C"; stop "editing the config failed - the original is restored"; }
-    printf 'FROM=%s\nBAR0=%s\nABAR0=%s\n' "$MAJ" "$bar0" "$abar0" > "$PEND"
+    # the partition (by its UUID, which survives disk renumbering) and folder of the config changed here: finish and
+    # cancel must change back this one, not whatever detection picks on that run
+    cpart=$(diskutil info "$EFI" 2>/dev/null | awk -F': *' '/Partition UUID/{print $2}')
+    printf 'FROM=%s\nBAR0=%s\nABAR0=%s\nCFGPART=%s\nCFGREL=%s\n' "$MAJ" "$bar0" "$abar0" "$cpart" "$OCREL" > "$PEND"
     cat > /Library/LaunchDaemons/com.nullmoth.osupdate.plist <<PL
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1052,6 +1131,17 @@ PL
     else do_prepare; cleanup; echo "RESULT ok"; exit 0; fi;;
   finish|cancel)
     . "$PEND" 2>/dev/null
+    # Change back the config "prepare" changed. Prepare's install step can switch the model (iMacPro1,1 to MacPro7,1)
+    # while the running Mac still reports the old one, so detection run before the next restart can reject the internal
+    # config and pick a 1401 stick instead: cancel then reports success and the driver stays parked.
+    if [ -n "${CFGPART:-}" ] && [ -n "${CFGREL:-}" ]; then
+      if mount_efi "$CFGPART" && [ -f "$MOUNT_POINT/$CFGREL/config.plist" ]; then
+        [ "$MOUNT_POINT/$CFGREL/config.plist" = "$C" ] || note "using the OpenCore config the Tahoe preparation changed ($MOUNT_POINT/$CFGREL), not $C"
+        C="$MOUNT_POINT/$CFGREL/config.plist"
+      else
+        stop "the OpenCore partition the Tahoe preparation changed (partition $CFGPART) is not connected - plug in the disk or stick it is on, then try again"
+      fi
+    fi
     if [ "$UPD" = finish ] && [ "${FROM:-}" = "$MAJ" ] && [ "$MAJ" = 15 ]; then echo "$(date) still on macOS $MAJ - waiting for the update"; cleanup; echo "RESULT ok"; exit 0; fi
     step "Setting the driver up for macOS $MAJ"; backup   # only once the update has happened: no backup per waiting boot
     if [ -d "/Library/NullMoth/kexts/$MAJ/NVAccel.kext" ]; then
@@ -1256,7 +1346,14 @@ for k in boot-args csr-active-config; do echo "$del" | grep -q "<string>$k</stri
 # host); without it nothing is changed and the reason is said. Pattern = 1401 policy.py _ZEN45_NAME.
 DVW_NEW=0
 CPUB=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)
-if printf '%s' "$CPUB" | grep -Eiq 'Ryzen AI([^A-Za-z0-9]|$)|Ryzen [3579] ([79][0-9][0-9]0(X3D|X|F)?|8[0-9][0-9]0[FG])([^A-Za-z0-9]|$)|Ryzen [3579] [78][0-9][45][0-9](HX3D|HX|HS|H|U)([^A-Za-z0-9]|$)' \
+# The risk is not the CPU's name but macOS writing NVRAM through a rewritten firmware memory map: an AMD config with
+# SetupVirtualMap or DevirtualiseMmio on. Boards that stopped POSTing (chat 10-10..10-15: AM5 X870/B650, an AM4 5600X)
+# all ran such configs without this quirk. Zen 4/5 by name stays covered, and so does every remapped AMD config.
+AMD_REMAP=0
+if printf '%s' "$CPUB" | grep -q AMD && { [ "$(get Booter.Quirks.SetupVirtualMap)" = true ] || [ "$(get Booter.Quirks.DevirtualiseMmio)" = true ]; }; then
+  AMD_REMAP=1; fi
+if { printf '%s' "$CPUB" | grep -Eiq 'Ryzen AI([^A-Za-z0-9]|$)|Ryzen [3579] ([79][0-9][0-9]0(X3D|X|F)?|8[0-9][0-9]0[FG])([^A-Za-z0-9]|$)|Ryzen [3579] [78][0-9][45][0-9](HX3D|HX|HS|H|U)([^A-Za-z0-9]|$)' \
+     || [ $AMD_REMAP = 1 ]; } \
    && [ "$(get Booter.Quirks.DisableVariableWrite)" != true ]; then
   ort=0; i=0
   while p=$(plutil -extract UEFI.Drivers.$i.Path raw -o - "$C" 2>/dev/null); do

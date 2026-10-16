@@ -9,10 +9,10 @@ import WebKit
 import UniformTypeIdentifiers
 
 struct Package {
-    static let version = "2.0.2"
-    static let name = "nullmoth-nvidia-2.0.2.tar.gz"
-    static let url = URL(string: "https://github.com/nullmoth/nvidia-macos-driver/releases/download/v2.0.2/nullmoth-nvidia-2.0.2.tar.gz")!
-    static let sha256 = "acf939c2829ae31a1840866cefc814c4b819168da1eb5f1ea257ea3e63e8753d"
+    static let version = "2.0.4"
+    static let name = "nullmoth-nvidia-2.0.4.tar.gz"
+    static let url = URL(string: "https://github.com/nullmoth/nvidia-macos-driver/releases/download/v2.0.4/nullmoth-nvidia-2.0.4.tar.gz")!
+    static let sha256 = "ae307a431cb0e964757c15ed68d090508e2d85d01160599fbe9b899ae9ccf81b"
 }
 let uploadPage = URL(string: "https://nullmothsystems.com/#send")!
 let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("NullMoth")
@@ -437,10 +437,26 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         case "logo": run(mode: "verbose", pkg: "", efi: b["efi"] as? String ?? "auto",
                          extra: ["--set-logo", (b["on"] as? Bool ?? true) ? "on" : "off",
                                  "--tool", Bundle.main.resourceURL!.appendingPathComponent("NullMothSafe.efi").path])
+        case "backlight": run(mode: "verbose", pkg: "", efi: b["efi"] as? String ?? "auto",
+                              extra: ["--backlight", (b["on"] as? Bool ?? false) ? "on" : "off"])
         // the opt-in AMD/Intel GPU driver (setup --gpu-test); --tool tells setup where the firmware list sits
-        case "gputest": run(mode: "verbose", pkg: "", efi: b["efi"] as? String ?? "auto",
-                            extra: ["--gpu-test", (b["on"] as? Bool ?? false) ? "on" : "off",
-                                    "--tool", Bundle.main.resourceURL!.appendingPathComponent("NullMothSafe.efi").path])
+        // a Mac with no NVIDIA card has no driver install behind it: the checked package rides along so setup can take
+        // the AMD/Intel test driver from it (setup verifies the SHA-256 again on a root-owned copy)
+        case "gputest":
+            let pk = (b["pkg"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            run(mode: "verbose", pkg: "", efi: b["efi"] as? String ?? "auto",
+                extra: ["--gpu-test", (b["on"] as? Bool ?? false) ? "on" : "off",
+                        "--tool", Bundle.main.resourceURL!.appendingPathComponent("NullMothSafe.efi").path]
+                    + (pk.map { ["--pkg", $0, "--sha", Package.sha256] } ?? []))
+        // macOS 15 -> 26: setup's one-button path ("--update prepare" with the package) installs or updates the driver,
+        // then parks it and sets the installer's small BAR; "--update cancel" puts it all back before the update
+        case "osupdate":
+            if b["cancel"] as? Bool ?? false {
+                run(mode: "tahoecancel", pkg: "", efi: b["efi"] as? String ?? "auto", extra: ["--update", "cancel"])
+            } else if let pk = b["pkg"] as? String, !pk.isEmpty {
+                run(mode: "tahoe", pkg: pk, efi: b["efi"] as? String ?? "auto", extra: ["--update", "prepare"])
+            }
+        case "swupdate": NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Software-Update-Settings.extension")!)
         default: break
         }
     }
@@ -472,11 +488,23 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         #endif
         let safe = sh("/usr/sbin/nvram", ["boot-args"]).split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" }).contains("-nvoff")
         let metal = metalDevices()
+        // Why no NVIDIA card shows up, when that is the case. Users on hybrid laptops copy -wegnoegpu / -wegonogpu from
+        // laptop guides (it hides every discrete GPU, NVIDIA included), and a disable-gpu property or a dGPU-off SSDT
+        // does the same: the card is then on the bus with another class code, or not on the bus at all.
+        let hiding = sysctl("kern.bootargs").split(separator: " ").map(String.init)
+            .filter { ["-wegnoegpu", "-wegonogpu", "-nvoff", "-wegnoigpu"].contains($0) }
+        let hiddenNvidia = services("IOPCIDevice").compactMap { s -> String? in
+            defer { IOObjectRelease(s) }
+            guard u32(s, "vendor-id").map({ $0 & 0xffff }) == 0x10DE, let cls = u32(s, "class-code"), cls >> 16 != 0x03,
+                  cls >> 16 != 0x04, let d = u32(s, "device-id") else { return nil }
+            return String(format: "10DE:%04X", d & 0xffff)
+        }
         return ["macos": "\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)", "major": os.majorVersion, "arch": arch,
                 "gpus": gpus, "opencore": oc, "kexts": kexts, "files": files, "metal": metal.names, "metalSource": metal.source,
                 "packages": findPackages(), "version": Package.version, "installedDriverVersion": recordedDriverVersion(), "safemode": safe,
                 "record": fm.fileExists(atPath: "/Library/NullMoth/state"), "crashes": driverCrashes().map(\.lastPathComponent),
-                "translated": sysctl("sysctl.proc_translated") == "1",
+                "translated": sysctl("sysctl.proc_translated") == "1", "gpuHiding": hiding, "hiddenNvidia": hiddenNvidia,
+                "hwModel": sysctl("hw.model"),
                 "profile": { var p = machineProfile(gpus); p["rules"] = Profile.select(rules(), p).ids; return p }()]
     }
 
@@ -971,7 +999,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
     }
 
     func run(mode: String, pkg: String, efi: String, extra: [String], expectedSha: String? = nil) {
-        guard ["dry", "install", "remove", "usbmap", "verbose"].contains(mode),
+        guard ["dry", "install", "remove", "usbmap", "verbose", "tahoe", "tahoecancel"].contains(mode),
               !runningSetup, pendingDownload == nil else { return }
         runningSetup = true
         let log: URL
@@ -1008,7 +1036,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         var args: [String]
         switch mode {
         case "remove": args = ["--remove"]
-        case "usbmap", "verbose": args = extra
+        case "usbmap", "verbose", "tahoecancel": args = extra
         default:
             args = ["--pkg", pkg, "--sha", expectedSha ?? Package.sha256, "--tool", res.appendingPathComponent("NullMothSafe.efi").path,
                     "--app", Bundle.main.executablePath ?? ""]

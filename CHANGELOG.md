@@ -1,5 +1,34 @@
 # Changelog
 
+## 2.3.1
+
+Safer updates
+- If an update cannot bring your display up, your Mac no longer stays on a black screen. After two starts in a row
+  that never reached the display, the driver turns itself off so macOS still starts, and the driver you had before the
+  update is put back automatically with one restart. Nothing stays running once an update has worked
+- Releases now also have to pass app checks on the new Metal driver (Terminal text, window capture) and may not do
+  worse than the release before
+
+## 2.3.0
+
+Fixes
+- Plugging a different monitor into the same port: macOS sees the new monitor (its name, size and modes) instead
+  of keeping the one it replaced
+- Terminal and other apps that draw text with programmable blending: text no longer comes out missing or garbled
+  (GTX 16 and others). Draws that read colour from a pass without every attachment were skipped; they are now drawn,
+  and overlapping triangles in one draw read each other's colour in order (thanks pengubow)
+- Above 60 Hz: the display and the accelerator woke up once per millisecond to check for a finished flip, which
+  users' flicker recordings showed as about 56 flips a second on a 143 Hz panel while windows moved. They now wake on
+  the flip itself (the display on macOS 15 and 26, the accelerator on macOS 26)
+- When a display's mode set is refused, the driver now tries the mode the firmware is already running before giving
+  up, and the log says why the mode was refused (reports of a black screen at login on some RTX 3060 boards)
+- Draws the Metal driver had to drop are now in the logs that Send logs collects
+
+AMD / Intel test program
+- 1401 can join the AMD and Intel GPU test program (AMD/Intel panel, Join). Testers get the newest signed test build
+  of the AMD/Intel driver, and after every restart 1401 sends what the driver did, so a start that hangs or panics
+  still reaches us. Leave the program from the same panel at any time
+
 ## 2.2.0
 
 This release makes the driver do one thing: drive NVIDIA GPUs. Everything else it used to carry is now its own

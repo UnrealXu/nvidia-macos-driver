@@ -292,6 +292,9 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     // This instance exists because a display appeared after boot (see gNDpyBoot), and its connect handler has already
     // been fired once -- see connectNotifyFire and enableController.
     bool fHotplugBorn = false, fConnectFired = false;
+    // A different monitor was plugged into this framebuffer's connector (its EDID changed): see adoptSwappedDisplay.
+    bool fEdidSwapped = false;
+    void adoptSwappedDisplay();
     static void connectNotifyFire(thread_call_param_t p0, thread_call_param_t);
     volatile SInt32 fStopping = 0;
     void scheduleCall(thread_call_t call, uint64_t deadline);
@@ -360,8 +363,10 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
         if (event->type == NVKMS_EVENT_TYPE_DPY_CHANGED || event->type == NVKMS_EVENT_TYPE_DYNAMIC_DPY_CONNECTED)
             FBLOG("kapi event type %d (display change)", (int)event->type);
         if (event->type == NVKMS_EVENT_TYPE_FLIP_OCCURRED && event->u.flipOccurred.head < 8
-            && event->u.flipOccurred.layer == NVKMS_KAPI_LAYER_PRIMARY_IDX)
+            && event->u.flipOccurred.layer == NVKMS_KAPI_LAYER_PRIMARY_IDX) {
             OSIncrementAtomic(&sFlipLatched[event->u.flipOccurred.head]);
+            flipWake(event->u.flipOccurred.head);
+        }
         // A display connected (or a connector changed) after boot: look for it off this context, after a short
         // settle (EDID reads follow the hot-plug interrupt).
         if (event->type == NVKMS_EVENT_TYPE_DPY_CHANGED || event->type == NVKMS_EVENT_TYPE_DYNAMIC_DPY_CONNECTED)
@@ -369,6 +374,8 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     }
     static void hotplugKick();
     static void hotplugFire(thread_call_param_t p0, thread_call_param_t);
+    static void flipWake(unsigned head);
+    bool waitFlipDone(unsigned limitMs);
     bool kapiInit();
     bool applyMode();
     void hudDraw();
@@ -520,7 +527,13 @@ public:
                   (unsigned long)v.v_width, (unsigned long)v.v_height, (unsigned long)v.v_rowBytes, (unsigned)i);
             return this;
         }
-        IOLog("NVRMFB: driver off - the firmware framebuffer is not on this card, not starting\n");
+        // the addresses, so a screen that stays dark with the driver off can be traced: macOS can move the card's VRAM
+        // window after the firmware drew into it (10-17: the firmware's window was gone on a Resizable BAR card)
+        IOLog("NVRMFB: driver off - the firmware framebuffer 0x%llx (+%llu) is not in this card's windows, not starting\n", base, bytes);
+        for (IOItemCount i = 0; i < provider->getDeviceMemoryCount(); i++)
+            if (IOMemoryDescriptor *m = provider->getDeviceMemoryWithIndex(i))
+                IOLog("NVRMFB:   window %u at 0x%llx (%llu B)\n", (unsigned)i,
+                      (unsigned long long)m->getPhysicalSegment(0, 0, kIOMemoryMapperNone), (unsigned long long)m->getLength());
         return NULL;
     }
     void free() override { OSSafeReleaseNULL(fAp); IOFramebuffer::free(); }
@@ -720,6 +733,9 @@ bool NVRMNVDAFramebuffer::kapiInit()
         if (getProvider()) getProvider()->setProperty("connected-displays", (unsigned long long)gNDpy, 32);
         FBLOG("ENUMERATED: %d connected display(s) of %u handle(s), %u heads available",
               gNDpy, n, fNumHeads);
+        // NVKMS answered and nothing is plugged into this card (its displays are on another GPU): the driver is up as
+        // far as it will go, so this start counts as good for the boot guard (nvrm_off.h)
+        if (n > 0 && gNDpy == 0) nvrm_guard_display_up("NVKMS lists this card's connectors and none has a display");
     }
 
     if (gBootHead == -2) {
@@ -1141,6 +1157,37 @@ void NVRMNVDAFramebuffer::connectNotifyFire(thread_call_param_t p0, thread_call_
     FBLOG("fb%u -> connect interrupt (the framework's registered handler)", me->fIndex);
     me->fConnect.proc(me->fConnect.target, me->fConnect.ref);
 }
+// A different monitor on this framebuffer's connector: take its EDID (what getDDCBlock hands macOS), its physical size,
+// its display-audio ELD, and the scaler/raster ceilings its own mode list allows. The scanout allocation made at start
+// is kept: it backs the surface WindowServer is drawing into, and it cannot be replaced under it. A new monitor whose
+// largest raster needs more than that allocation is offered what fits (the mode check refuses the rest as larger than
+// the scanout allocation) and gets its full size at the next start; the log says so.
+void NVRMNVDAFramebuffer::adoptSwappedDisplay()
+{
+    if (fIndex >= (unsigned)gNDpy) return;
+    const struct nvrm_dpy_rec *r = &gDpy[fIndex];
+    fEdidSize = (NvU16)(r->edidSize > sizeof fEdid ? sizeof fEdid : r->edidSize);
+    nvu_copy(fEdid, r->edid, fEdidSize);
+    nvrmEdidPanelSizeMm(fEdid, fEdidSize, &fEdidMmW, &fEdidMmH);
+    if (!fInternal && fEdidSize >= 128) {
+        uint8_t eld[NVRM_ELD_MAX];
+        size_t eldn = nvrm_build_eld(fEdid, fEdidSize, NVRM_ELD_CONN_HDMI, eld);
+        if (eldn) { if (OSData *d = OSData::withBytes(eld, (unsigned)eldn)) { setProperty("nvda-eld", d); d->release(); } }
+        else removeProperty("nvda-eld");
+    }
+    const NvU64 keepAlloc = fAllocSize;
+    const NvU32 oldW = fScalerMaxW, oldH = fScalerMaxH;
+    computeScanoutCaps(fPitchAlign);
+    const bool short_ = fAllocSize > keepAlloc;
+    fAllocSize = keepAlloc;
+    // ceilings past the allocation would let a desktop scan out beyond the end of its memory: keep the ones that fit
+    if (short_) { fScalerMaxW = oldW; fScalerMaxH = oldH; fRasterMaxW = oldW; }
+    fEdidHits = 0;
+    FBLOG("fb%u: adopted the new monitor's EDID (%u B, panel %ux%u mm); ceilings %ux%u -> %ux%u%s", fIndex,
+          (unsigned)fEdidSize, (unsigned)fEdidMmW, (unsigned)fEdidMmH, (unsigned)oldW, (unsigned)oldH,
+          (unsigned)fScalerMaxW, (unsigned)fScalerMaxH,
+          short_ ? "; its largest modes need more scanout memory than this start reserved - full size after a restart" : "");
+}
 void NVRMNVDAFramebuffer::hotplugKick()
 {
     if (!gHotplug) return;
@@ -1162,8 +1209,8 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
     IORecursiveLock *sl = startLock();
     if (sl) IORecursiveLockLock(sl);
     for (NvU32 i = 0; i < n; i++) {
-        bool known = false;
-        for (int k = 0; k < gNDpy; k++) if (gDpy[k].handle == handles[i]) { known = true; break; }
+        bool known = false; int kdpy = -1;
+        for (int k = 0; k < gNDpy; k++) if (gDpy[k].handle == handles[i]) { known = true; kdpy = k; break; }
         nvu_zero(dd, sizeof *dd); dd->handle = handles[i];
         bool dynOk = me->fKms->getDynamicDisplayInfo(me->fDev, dd);
         if (known) {
@@ -1172,11 +1219,26 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
             // that was seen disconnected and is connected again gets its head lit with the same full mode set the
             // display-wake path uses (reflip). Only on that transition, so other display events cause no modeset.
             if (!dynOk) continue;
+            // NVKMS names a display by its connector, so a DIFFERENT monitor plugged into the same port comes back as
+            // the same handle. Its EDID is what tells them apart: the old EDID stayed published, and macOS kept the
+            // previous monitor's name, size and modes (a new monitor still listed as the one it replaced).
+            bool swapped = false;
+            if (dd->connected && kdpy >= 0 && dd->edid.bufferSize >= 128) {
+                const NvU32 sz = dd->edid.bufferSize > sizeof gDpy[kdpy].edid ? (NvU32)sizeof gDpy[kdpy].edid : dd->edid.bufferSize;
+                if (sz != gDpy[kdpy].edidSize || memcmp(gDpy[kdpy].edid, dd->edid.buffer, sz) != 0) {
+                    nvu_copy(gDpy[kdpy].edid, dd->edid.buffer, sz); gDpy[kdpy].edidSize = sz;
+                    swapped = true;
+                    FBLOG("hot-plug: display 0x%x has a different monitor now (EDID %u B, maker %02x%02x product %02x%02x)",
+                          handles[i], (unsigned)sz, dd->edid.buffer[8], dd->edid.buffer[9], dd->edid.buffer[11], dd->edid.buffer[10]);
+                }
+            }
             for (unsigned f = 0; f < sizeof gFBs / sizeof gFBs[0]; f++) {
                 NVRMNVDAFramebuffer *fb = gFBs[f];
                 if (!fb || fb->fDisplay != handles[i]) continue;
                 if (!dd->connected) { if (!fb->fDpyLost) FBLOG("hot-plug: display 0x%x went away (fb %u)", handles[i], fb->fIndex); fb->fDpyLost = true; }
-                else if (fb->fDpyLost && nrelight < sizeof relight / sizeof relight[0]) { fb->fDpyLost = false; fb->retain(); relight[nrelight++] = fb; }
+                else if ((fb->fDpyLost || swapped) && nrelight < sizeof relight / sizeof relight[0]) {
+                    fb->fDpyLost = false; if (swapped) fb->fEdidSwapped = true; fb->retain(); relight[nrelight++] = fb;
+                }
             }
             continue;
         }
@@ -1199,6 +1261,15 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
         bool ok = !OSAddAtomic(0, &fb->fStopping) && !fb->fHeadSlept && fb->reflip();
         FBLOG("hot-plug: display 0x%x is back (fb %u): head %u lit again -> ok %u rc %d",
               fb->fDisplay, fb->fIndex, fb->fHead, (unsigned)ok, fb->fReflipRc);
+        if (fb->fEdidSwapped && !OSAddAtomic(0, &fb->fStopping)) {
+            fb->fEdidSwapped = false;
+            fb->adoptSwappedDisplay();
+            // the framework's connect-change path re-reads the EDID (getDDCBlock), the modes and the display's name,
+            // as it does when a monitor is plugged into a real Mac; the head is lit first so it re-probes a live display
+            if (!gConnectNotify) gConnectNotify = thread_call_allocate(connectNotifyFire, nullptr);
+            uint64_t d; clock_interval_to_deadline(500, kMillisecondScale, &d);
+            if (gConnectNotify) thread_call_enter1_delayed(gConnectNotify, fb, d);
+        }
         fb->release();
     }
     if (!added) return;
@@ -1249,6 +1320,35 @@ static IORecursiveLock *startLock()
     }
     return gL;
 }
+// Waiting for a flip to complete. Polling NVKMS's pending flag with IOSleep(1) overslept each check by a millisecond or
+// more, and a frame went through two such waits: harmless in a 16.7 ms frame, but at 144 Hz (6.9 ms) the flip landed a
+// vblank late and the desktop ran near half the panel rate while the hardware cursor stayed smooth (1401 "Record
+// flicker" on a 143 Hz panel: 56 flips/s median; 540 Hz: 192/s). The flip-occurred event now wakes the waiter, and the
+// pending flag (still the truth) is re-read at least every 250 us; the 100 ms bound is unchanged.
+static IOLock *sFlipWaitLock;
+static volatile SInt32 sFlipWakeEv[8];
+void NVRMNVDAFramebuffer::flipWake(unsigned head)
+{
+    if (head < 8 && sFlipWaitLock) IOLockWakeup(sFlipWaitLock, (event_t)&sFlipWakeEv[head], false);
+}
+bool NVRMNVDAFramebuffer::waitFlipDone(unsigned limitMs)
+{
+    if (!sFlipWaitLock) { IOLock *l = IOLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&sFlipWaitLock)) IOLockFree(l); }
+    uint64_t end = 0; clock_interval_to_deadline(limitMs, kMillisecondScale, &end);
+    for (;;) {
+        NvBool pending = NV_TRUE;
+        if (!fKms->getFlipPendingStatus(fDev, fHead, NVKMS_KAPI_LAYER_PRIMARY_IDX, &pending)) return false;
+        if (!pending) return true;
+        uint64_t now = mach_absolute_time();
+        if (now >= end) return false;
+        uint64_t next = 0; clock_interval_to_deadline(250, kMicrosecondScale, &next);
+        if (next > end) next = end;
+        if (!sFlipWaitLock) { IOSleep(1); continue; }
+        IOLockLock(sFlipWaitLock);
+        IOLockSleepDeadline(sFlipWaitLock, (event_t)&sFlipWakeEv[fHead < 8 ? fHead : 0], next, THREAD_UNINT);
+        IOLockUnlock(sFlipWaitLock);
+    }
+}
 // Flip completion-wait controls, surfaced through the debug.nvrmfb_flip_latch* sysctls registered
 // below. gFlipLatch gates the wait (default 1; 0 is a debug bypass that lets a surface retire before
 // its flip latches, i.e. reintroduces the strobe). The counters report the real wait the compositor
@@ -1270,13 +1370,7 @@ NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig 
     if (fSubmissionSeen) {
         // Initial console acceptance is asynchronous. A still-pending prior flip
         // must receive the same bounded completion wait as a newly committed flip.
-        bool complete = false;
-        for (unsigned i = 0; i < 100; ++i) {
-            NvBool pending = NV_TRUE;
-            if (!fKms->getFlipPendingStatus(fDev, fHead, NVKMS_KAPI_LAYER_PRIMARY_IDX, &pending)) break;
-            if (!pending) { complete = true; break; }
-            IOSleep(1);
-        }
+        const bool complete = waitFlipDone(100);
         if (!complete) {
             FBLOG("presentation blocked: prior completion unavailable on head %u", fHead);
             fSubmissionFaulted = true; return NV_FALSE;
@@ -1318,15 +1412,11 @@ NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig 
     if (bootstrap || !gFlipLatch) return NV_TRUE;
     OSIncrementAtomic((volatile SInt32 *)&gFlipLatchWaits);
     const uint64_t latch0 = mach_absolute_time();
-    for (unsigned i = 0; i < 100; ++i) {
-        NvBool pending = NV_TRUE;
-        if (!fKms->getFlipPendingStatus(fDev, fHead, NVKMS_KAPI_LAYER_PRIMARY_IDX, &pending)) break;
-        if (!pending) {
-            const int us = (int)((mach_absolute_time() - latch0) / 1000);
-            if (us > gFlipLatchMaxUs) gFlipLatchMaxUs = us;
-            return NV_TRUE;
-        }
-        IOSleep(1);
+    if (waitFlipDone(100)) {
+        uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - latch0, &ns);
+        const int us = (int)(ns / 1000);
+        if (us > gFlipLatchMaxUs) gFlipLatchMaxUs = us;
+        return NV_TRUE;
     }
     // Keep both the old front and submitted surface alive until a proven recovery/reboot.
     OSIncrementAtomic((volatile SInt32 *)&gFlipLatchTimeouts);
@@ -1813,9 +1903,9 @@ bool NVRMNVDAFramebuffer::applyMode()
     lr->flags.surfaceChanged = lr->flags.srcXYChanged = lr->flags.srcWHChanged = lr->flags.dstXYChanged = lr->flags.dstWHChanged = NV_TRUE;
     nvrmUnownedHeadsOff(cfg);
     NvBool ok = submitConfig(cfg, rep, NV_TRUE, true);
-    // The firmware's boot timing is not always one NVKMS validates for the display (seen on an RTX 3060 at 1920x1080: the
-    // GOP's 2200x1125 raster refused, every commit rejected, CoreDisplay asserted in CGXMappedDisplayStart and
-    // WindowServer crash-looped). The mode NVKMS validated for the same raster scans out the same surface, so retry with it.
+    // A refused first mode set leaves WindowServer asserting in CGXMappedDisplayStart and crash-looping (an RTX 3060 at
+    // 1920x1080, 2.1.0 and 2.2.0). First retry with the mode NVKMS validated for the same raster, when it differs from the
+    // firmware's timing (it scans out the same surface).
     if (!ok && fHaveKmsMode && memcmp(&fMode, &fKmsMode, sizeof fMode) != 0 &&
         fKmsMode.timings.hVisible == fRasterW && fKmsMode.timings.vVisible == fRasterH) {
         FBLOG("applyMode: firmware timing pclk %u %ux%u refused; retrying with NVKMS's validated mode pclk %u %ux%u @%u",
@@ -1825,6 +1915,25 @@ bool NVRMNVDAFramebuffer::applyMode()
         nvu_zero(rep, sizeof *rep);
         ok = submitConfig(cfg, rep, NV_TRUE, true);
         if (ok) fMode = fKmsMode;
+    }
+    // Then keep the mode the firmware is already scanning out and only put our surface on the head: a flip, no mode set.
+    // KAPI takes the flip path only when no head in the request changes mode, activity or displays, so the request holds
+    // this head alone. The 2.2.0 log of that RTX 3060 shows the validated mode equals the firmware's, so the refusal is
+    // not the timing; NVKMS now logs its reason codes ("[kapi] set mode refused").
+    if (!ok) {
+        nvu_zero(cfg, sizeof *cfg); nvu_zero(rep, sizeof *rep);
+        cfg->headsMask = 1u << fHead;
+        nvrmHeadConfigBaseline(hr, fGammaOn ? fGamma : NULL);
+        hr->modeSetConfig.bActive = NV_TRUE; hr->modeSetConfig.numDisplays = 1; hr->modeSetConfig.displays[0] = fDisplay;
+        hr->modeSetConfig.mode = fMode;
+        lr->config.surface = fSurf; lr->config.srcWidth = fW; lr->config.srcHeight = fH;
+        lr->config.dstWidth = fRasterW; lr->config.dstHeight = fRasterH;
+        lr->config.compParams.compMode = NVKMS_COMPOSITION_BLENDING_MODE_OPAQUE; lr->config.minPresentInterval = 1;
+        lr->flags.surfaceChanged = lr->flags.srcXYChanged = lr->flags.srcWHChanged = lr->flags.dstXYChanged =
+            lr->flags.dstWHChanged = NV_TRUE;
+        ok = submitConfig(cfg, rep, NV_TRUE, true);
+        FBLOG("applyMode: mode set refused; flip onto the firmware's running %ux%u mode on head %u -> %u (flipResult %d)",
+              fRasterW, fRasterH, fHead, (unsigned)ok, (int)rep->flipResult);
     }
     fLastOk = (unsigned)ok; fFlipResult = (int)rep->flipResult;
     FBLOG("applyModeSetConfig -> %u (flipResult %d)", ok, (int)rep->flipResult);
@@ -1955,6 +2064,7 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     registerPowerDriver(this, kFBPowerStates, 2);
     FBLOG("registerPowerDriver(2 states) done");
     FBLOG("started on %s", provider->getName());
+    nvrm_guard_display_up("the framebuffer has its scanout memory and a display mode");
     return true;
 }
 void NVRMNVDAFramebuffer::scheduleCall(thread_call_t call, uint64_t deadline)

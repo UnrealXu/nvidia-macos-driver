@@ -1,5 +1,40 @@
 # Changelog
 
+## 2.3.3
+
+Stability
+- 2.3.2 made some Macs worse: blank or torn windows and a Dock missing its apps on macOS Sequoia, WindowServer
+  crashes on some Tahoe desktops. Its display changes (screenshots and the lock screen, the brightness and video-memory
+  logging, the Turing flip change) are withdrawn from the package until they pass a staged test with the testers.
+  2.3.3 ships the 2.3.1 driver, which has the longest clean record in the field, on both macOS 15 and macOS 26
+- macOS Sequoia: installing and updating works again (the 2.3.2 fix is kept: the Metal driver is built for macOS 15)
+- After a rollback, the installed version record follows the files that are really installed (kept from 2.3.2)
+
+## 2.3.2
+
+Fixes
+- macOS Sequoia: installing or updating to 2.3.0 or 2.3.1 stopped with "runtime payload requires macOS 26.0.0". The
+  Metal driver in those packages was built for macOS 26 only; it is built for macOS 15 again, and a release can no
+  longer ship anything that needs a newer macOS than 15
+- Screenshots, window captures and the lock screen showed a blurred or empty window. macOS reads a window right
+  after drawing it, and the driver now finishes the drawing first, as Apple's drivers do
+- Send logs now includes how much of the card's video memory window is in use, so a black screen with only a
+  cursor can be told apart from a leak
+- After an update was rolled back, Send logs still named the new version. The installed version now follows the files
+  that are actually installed, so reports say what your Mac is really running
+- The Metal driver never hands the GPU a missing texture or sampler; it uses an empty one and logs it (a cause of
+  Safari crashes in older versions)
+- Laptops with the screen on the NVIDIA GPU: every step of the brightness setup is logged, so brightness that stays
+  greyed out can be traced from Send logs
+
+AMD / Intel test program
+- A test driver that fails to start no longer panics the Mac: memory still mapped when the start gave up is kept
+  until it is unmapped, instead of being freed under the mapping
+- Intel 11th and 12th gen graphics (Tiger Lake, Rocket Lake, Alder Lake-S) and DG1 now reach the Intel driver. Two
+  drivers list these chips and the device was offered to the wrong one, so neither took it
+- When a start fails, its first error lines are kept and reported on the next start, even if the Mac stopped
+- The test driver's log names AMD and Intel devices correctly
+
 ## 2.3.1
 
 Safer updates

@@ -1,5 +1,49 @@
 # Changelog
 
+## 2.3.5
+
+Stability
+- The login screen no longer stays black for a minute after the display comes up. The driver waited 60 seconds before
+  letting the compositor's frames reach the panel, on the assumption that the screen was already showing them another
+  way; on macOS 26 it was not, so every boot sat on a black login screen for exactly that minute
+
+## 2.3.4
+
+Pre-release for the early-updates testers; it becomes the general release only after every GPU generation passes the
+field gate.
+
+Stability
+- Window dragging, Launchpad and games stutter less: each screen update waits at most one refresh period for the
+  previous one, instead of a fixed tenth of a second; the wait wakes on the display's own event
+- macOS Sequoia screenshots and window captures: the capture ordering fix from 2.3.2 returns, and it now follows what the
+  installed kernel driver supports, so a Metal driver and a kernel driver from different versions never mismatch again
+- Turing (GTX 16 and RTX 20): the login screen no longer stays black with a cursor when the first frame has not been
+  drawn yet; the driver only shows video memory the Metal driver has written
+- Turing: the ten-second start wait the installer used to add is now the driver's own default, so a laptop card or a Mac
+  whose boot arguments were rewritten gets it too (a value you set yourself still wins)
+- Laptops with a hybrid display: the driver no longer copies the boot screen from another card's memory, which could
+  stop the Mac during startup. When WhateverGreen is present next to the driver, the installer notes the gfxrst setting it needs
+- A Mac reset during the driver's own start-up wait (the ten-second Turing settle, the 100-second wait when the card's
+  memory window cannot be moved) no longer counts toward switching the driver off. Two such resets used to leave a
+  working Mac on the fallback driver, reported at the next login as "driver loaded: no"
+- A GPU that is busy is not a GPU that is gone: the Metal driver keeps waiting for a late frame instead of disabling
+  itself for the rest of the process. In WindowServer that disablement meant every later command buffer was refused
+  and the session restarted ("Failed to get a MTLCommandBuffer")
+- Every kernel driver now carries the package version. A Mac that still runs an older kernel driver after an update
+  (the kernel collection was not rebuilt) is named in Send logs and in the "reached the desktop" report instead of
+  counting as the new version
+
+Logging (so a report says what happened)
+- The kernel driver logs its own version at start
+- A full video-memory window logs the first refusals and then every 256th, with one line saying who holds the window
+- Spare framebuffer instances (more instances than displays) say so instead of reporting a failure
+- A display that stops flipping logs how long the frame had been pending and the flip counters
+- Every ten seconds of screen activity, one line per display records the flip rate against the panel rate, missed
+  refreshes and skipped frames
+- A refused mode set or flip in the kernel names the stage that refused it
+- The Metal driver says why it could not begin a command buffer (a lost GPU, a failed allocation), the line
+  WindowServer crashes without
+
 ## 2.3.3
 
 Stability

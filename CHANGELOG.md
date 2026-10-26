@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.6.2
+
+- The same driver as 2.6.0, released with fixes to the 1401 apps for Mac and Windows.
+
+## 2.6.1
+
+- The same driver as 2.6.0, released with the redesigned 1401 apps for Mac and Windows.
+
+## 2.6.0
+
+- An update of the driver takes one restart. macOS shows a notice that the extensions were updated while the installer replaces them, and the installer used to answer it with "allow the extensions, then reboot once more"; the new driver already loads on the first restart (measured: every extension approved, none held back), so on an update it now says one restart is enough. A first install still asks you to allow the extensions once.
+
 ## 2.5.5
 
 - Discord videos play again. 2.5.4 stopped registering the hardware video decoder in every sandboxed process, and Discord decodes inside its own sandboxed GPU process, so its videos did not play at all. Only Apple's sandboxed apps (Safari, QuickTime, Preview) now hand decoding to macOS's video decoding service; Chromium and Electron apps decode in their own process as in 2.5.3.

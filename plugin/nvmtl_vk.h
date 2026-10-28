@@ -8,7 +8,7 @@
 #include <stdint.h>
 #include <stddef.h>
 const char *nvmtl_image_ident(const void *addr, char *out, size_t n);
-typedef struct { void *buf; void *mem; void *map; size_t size; size_t alloc; int placed; void *pool; size_t poff; int imported; int bar1; size_t moff; int sparse, sysmem; } nvk_buffer;
+typedef struct { void *buf; void *mem; void *map; size_t size; size_t alloc; int placed; void *pool; size_t poff; int imported; int bar1; size_t moff; int sparse, sysmem; int mtype1; /* memory type + 1 when known */ } nvk_buffer;
 #include "nvmtl_sample_positions.h"
 typedef struct { void *img; void *mem; void *view; uint32_t w, h; size_t alloc; uint32_t layout; uint32_t mips; uint32_t fmt, bpp; uint32_t storage, mtl_type, layers; int placed; uint32_t bw, bh; uint32_t samples; uint32_t sysmem; uint32_t vkflags, usage;  uint32_t vfl;  uint64_t up_token; } nvk_image;
 #define NVMTL_NVAR 16
@@ -39,6 +39,8 @@ typedef struct { void *rp; void *pipe; void *layout; int has_depth; uint32_t dfm
     uint32_t fetch_zero;   /* framebuffer fetch is off but the fragment shader reads [[color(n)]]: set 3 holds the dummy image */
     uint32_t stencil_emu;  /* the fragment shader's stencil export was lowered to a per-bit discard (push constant 160) */
     uint32_t skip_draws;   /* NVMTL_SKIP_FS names this fragment shader: its draws are not recorded (hang bisection) */
+    void *gl_uniform_alt; /* optional owned GL-only pipeline; the original remains the draw-time fallback */
+    uint32_t gl_uniform_layout, gl_uniform_slot[2], gl_uniform_range[2], gl_uniform_tracked;
 } nvk_pipeline;
 void nvmtl_vk_pipeline_destroy(nvk_pipeline *p);
 typedef struct { void *pool; nvk_buffer stage; } nvk_queue;
@@ -64,10 +66,13 @@ typedef struct { void *cb; void *fb; void *pool; void *dset[2]; void *depth_view
                  nvk_setref *sets; unsigned nsets, capsets;
                  void *address_pages; unsigned address_count;
                  unsigned nobind, skipped;
-                 void *dcache[32]; void *dcachepool; unsigned ndcache;
+                 void *dcache[32]; void *dcachepool; unsigned ndcache, dcache_gl_uniform;
                  unsigned in_rp, occlusion_reset; uint32_t wseq;
                  void *fetchview[NVMTL_NCOL];   /* the open pass's colour views, read by [[color(n)]] framebuffer fetch */
                  unsigned fetch_draw, topo;   /* the bound pipeline reads [[color(n)]] in this pass; last MTLPrimitiveType set */
+                 /* the last framebuffer fetch set made in this command buffer and what it points at: a draw whose pass
+                    and mask are the same reuses it (Core Animation draws hundreds of fetch draws per pass) */
+                 void *fetch_last_set; uint32_t fetch_last_mask; void *fetch_last_view[NVMTL_NCOL];
                  /* stencil export emulation (nvmtl_semu_draw): the bound pipeline's layout when it exports stencil, and the
                     stencil reference / write masks / depth write last set, which each per-bit pass changes and restores */
                  void *semu_layout; uint32_t st_ref[2], st_wmask[2]; int depth_write;
@@ -84,7 +89,8 @@ typedef struct { void *cb; void *fb; void *pool; void *dset[2]; void *depth_view
                  void *tab_out[2];      /* the table page buffer that set's descriptor names */
                  /* Vulkan graphics bindings persist until changed; compute has its own bind point. */
                  void *graphics_pipeline, *graphics_layout, *graphics_sets[3];
-                 uint32_t graphics_set_count, graphics_offset_count, graphics_offsets[2];
+                 uint32_t graphics_set_count, graphics_offset_count, graphics_offsets[4], gl_uniform_dyn[2];
+                 uint32_t gl_uniform_result; /* optional diagnostics for the next recorded draw */
                } nvk_cmdbuf;
 int  nvmtl_vk_init(void);
 int nvmtl_vk_sample_positions_backend(void);
@@ -179,6 +185,8 @@ int  nvmtl_vk_sampler_create(int linear, int repeat, nvk_sampler *out);
 int  nvmtl_vk_sampler_create_desc(const nvmtl_sampler_desc *desc, nvk_sampler *out);
 void nvmtl_vk_sampler_destroy(nvk_sampler *s);
 int  nvmtl_vk_bind_sampler(nvk_cmdbuf *c, uint32_t set, uint32_t index, nvk_sampler *s);
+int  nvmtl_vk_bind_parked_sampler(nvk_cmdbuf *c, uint32_t set, uint32_t index, nvk_sampler *s);
+void nvmtl_vk_parked_samplers_keep(nvk_cmdbuf *c, uint32_t set, uint32_t keep);
 void nvmtl_vk_cmd_bind_set(nvk_cmdbuf *c, nvk_pipeline *p);
 int  nvmtl_vk_compute_pipeline_create(const void *cs, size_t n, nvk_pipeline *out);
 void nvmtl_vk_cmd_dispatch(nvk_cmdbuf *c, nvk_pipeline *p, uint32_t gx, uint32_t gy, uint32_t gz);
@@ -213,7 +221,9 @@ extern void (*nvmtl_pre_release_hook)(void *);
 extern void (*nvmtl_pre_submit_hook)(void);
 int  nvmtl_vk_image_read(nvk_queue *q, nvk_image *img, void *dst, size_t row_bytes);
 int  nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes);
-int  nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes);
+int  nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, nvk_buffer *cache);
+int  nvmtl_vk_image_read_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, nvk_buffer *cache);
+void nvmtl_vk_host_pages_drop(nvk_buffer *cache);
 int  nvmtl_vk_copy_buffer(nvk_queue *q, nvk_buffer *src, size_t srcOff, nvk_buffer *dst, size_t dstOff, size_t size);
 int  nvmtl_vk_image_create_mips(uint32_t w, uint32_t h, int bgra, uint32_t mips, nvk_image *out);
 int  nvmtl_vk_image_create_ex(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, uint32_t mips, nvk_image *out);
@@ -250,6 +260,8 @@ typedef struct { nvk_image *col[NVMTL_NCOL]; void *colview[NVMTL_NCOL]; uint32_t
 typedef struct { uint32_t ncol, cfmts[NVMTL_NCOL], has_depth, dfmt, samples; } nvk_rtsig;
 int  nvmtl_vk_pipeline_create_rt(const void *vs, size_t vn, const void *fs, size_t fn, const nvk_rt *rt, const void *vin, uint32_t samples,
                                  const nvk_tess_desc *td, void *out);
+void nvmtl_vk_pipeline_try_gl_uniform(const void *vs, size_t vn, const void *fs, size_t fn, uint32_t vi, uint32_t fi,
+                                     const nvk_rt *rt, const void *vin, uint32_t samples, nvk_pipeline *base);
 int  nvmtl_vk_cmd_begin_pass(nvk_cmdbuf *c, const nvk_pass *ps, nvk_pipeline *p);
 int  nvmtl_vk_cmd_empty_pass(nvk_cmdbuf *c, const nvk_pass *ps);
 int  nvmtl_vk_pass_kind(const nvk_pass *ps);

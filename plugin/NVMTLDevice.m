@@ -23,6 +23,7 @@
 #include "nvmtl_sample_positions.h"
 #include "nvmtl_log_failure.h"
 #include <sys/sysctl.h>
+#import <libproc.h>
 #ifndef NVMTL_RELEASE
 #define NVMTL_RELEASE 0
 #endif
@@ -39,6 +40,8 @@ static inline FILE *nvmtl_rel_fopen(const char *p, const char *m) { return nvmtl
 #define fopen(p, m) nvmtl_rel_fopen(p, m)
 #endif
 int nvmtl_vk_init(void);
+static uint32_t nvmtl_gl_uniform_index(id function);
+static void nvmtl_gl_uniform_inherit(id function, id source);
 void nvmtl_gl_caps_enable(void);
 uint16_t nvmtl_vk_set_accelerator(mach_port_t accelerator);
 uint16_t nvmtl_vk_vendor(void);
@@ -506,11 +509,48 @@ static bool nvmtl_angle_chrome_family(void)
 {
     const char *me = getprogname();
     if (!me) return false;
-    return strncmp(me, "Google Chrome", 13) == 0 ||
-           strncmp(me, "Brave Browser", 13) == 0 ||
-           strncmp(me, "Microsoft Edge", 14) == 0 ||
-           strncmp(me, "Chromium", 8) == 0 ||
-           strncmp(me, "Discord", 7) == 0;
+
+    // 1. By process name. "Helper" and "Edge" alone also match unrelated apps (every app's own helper tools,
+    // "EdgeView"), so Edge is matched by its full name and helpers through the framework check below.
+    if (strstr(me, "Chrome") != NULL ||
+        strstr(me, "Chromium") != NULL ||
+        strstr(me, "Electron") != NULL ||
+        strstr(me, "Brave") != NULL ||
+        strncmp(me, "Microsoft Edge", 14) == 0 ||
+        strstr(me, "Discord") != NULL) {
+        return true;
+    }
+
+    // 2. Deep Path: Precise inspection based on file path features (mapping find command rules)
+    char path[PATH_MAX];
+    if (proc_pidpath(getpid(), path, sizeof(path)) <= 0) {
+        return false;
+    }
+
+    char app_path[PATH_MAX];
+    strlcpy(app_path, path, sizeof(app_path));
+
+    char *p = strstr(app_path, ".app");
+    if (p != NULL) {
+        *(p + 4) = '\0'; // Truncate to the root directory of .app
+
+        char check_buf[PATH_MAX];
+
+        // Corresponding to the full feature checks in the find command
+        snprintf(check_buf, sizeof(check_buf), "%s/Contents/Frameworks/libEGL.dylib", app_path);
+        if (access(check_buf, F_OK) == 0) return true;
+
+        snprintf(check_buf, sizeof(check_buf), "%s/Contents/Frameworks/Chromium Embedded Framework.framework", app_path);
+        if (access(check_buf, F_OK) == 0) return true;
+
+        snprintf(check_buf, sizeof(check_buf), "%s/Contents/Frameworks/Electron Framework.framework", app_path);
+        if (access(check_buf, F_OK) == 0) return true;
+
+        snprintf(check_buf, sizeof(check_buf), "%s/Contents/Frameworks/libffmpeg.dylib", app_path);
+        if (access(check_buf, F_OK) == 0) return true;
+    }
+
+    return false;
 }
 __attribute__((constructor)) static void nvmtl_angle_allow_nvidia(void)
 {
@@ -955,6 +995,47 @@ static void nvmtl_vram_tag_set(IOSurfaceRef surf, NSUInteger plane, uint32_t see
     CFDataRef d = CFDataCreate(NULL, (const UInt8 *)&t, sizeof t); CFStringRef k = nvmtl_vram_tag_key(plane);
     IOSurfaceSetValue(surf, k, d); CFRelease(k); CFRelease(d);
 }
+typedef struct { uint32_t magic, done; uint64_t stamp_ns, seq; int32_t pid; uint32_t pad; } nvmtl_busy_tag;
+#define NVMTL_BUSY_MAGIC 0x4255535au
+#define NVMTL_BUSY_WAIT_NS  (10ull * 1000 * 1000)
+#define NVMTL_BUSY_STALE_NS (100ull * 1000 * 1000)
+#define NVMTL_BUSY_POLL_US 100
+static CFStringRef nvmtl_busy_key(NSUInteger plane) { return CFStringCreateWithFormat(NULL, NULL, CFSTR("NVMTLBusyAt:p%lu"), (unsigned long)plane); }
+static int nvmtl_busy_read(IOSurfaceRef surf, NSUInteger plane, nvmtl_busy_tag *out)
+{
+    CFStringRef k = nvmtl_busy_key(plane); CFTypeRef v = IOSurfaceCopyValue(surf, k); CFRelease(k);
+    nvmtl_busy_tag t = { 0, 0, 0, 0, 0, 0 };
+    int ok = v && CFGetTypeID(v) == CFDataGetTypeID() && CFDataGetLength((CFDataRef)v) == (CFIndex)sizeof t;
+    if (ok) memcpy(&t, CFDataGetBytePtr((CFDataRef)v), sizeof t);
+    if (v) CFRelease(v);
+    ok = ok && t.magic == NVMTL_BUSY_MAGIC;
+    if (ok && out) *out = t;
+    return ok;
+}
+static void nvmtl_busy_write(IOSurfaceRef surf, NSUInteger plane, uint64_t seq, int done)
+{
+    nvmtl_busy_tag t = { NVMTL_BUSY_MAGIC, (uint32_t)done, clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW), seq, getpid(), 0 };
+    CFDataRef d = CFDataCreate(NULL, (const UInt8 *)&t, sizeof t); CFStringRef k = nvmtl_busy_key(plane);
+    IOSurfaceSetValue(surf, k, d); CFRelease(k); CFRelease(d);
+}
+static int nvmtl_busy_foreign(IOSurfaceRef surf, NSUInteger plane)
+{
+    nvmtl_busy_tag t;
+    return nvmtl_busy_read(surf, plane, &t) && t.pid != getpid();
+}
+static void nvmtl_busy_wait(IOSurfaceRef surf, NSUInteger plane)
+{
+    nvmtl_busy_tag t;
+    if (!nvmtl_busy_read(surf, plane, &t) || t.done || t.pid == getpid()) return;
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    if (t.stamp_ns <= t0 && t0 - t.stamp_ns > NVMTL_BUSY_STALE_NS) return;
+    for (;;) {
+        usleep(NVMTL_BUSY_POLL_US);
+        if (!nvmtl_busy_read(surf, plane, &t) || t.done || t.pid == getpid()) return;
+        const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+        if (now - t0 > NVMTL_BUSY_WAIT_NS || (t.stamp_ns <= now && now - t.stamp_ns > NVMTL_BUSY_STALE_NS)) return;
+    }
+}
 static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
                                       uint32_t vkf, uint32_t bpp, int a8, int stex)
 {
@@ -1030,7 +1111,7 @@ static char nvmtl_surface_cache_key;
     if (nvmtl_surface_image_create(t, surf, plane, (uint32_t)w, (uint32_t)h, vkf, bpp, a8, wantStex)) {
         nvlog("newTextureWithDescriptor:iosurface:plane: image create FAILED (%zux%zu)", w, h); return nil; }
     t->_q = nvmtl_device_queue();
-    t->_surf = surf; if (surf) { CFRetain(surf); t->_surfOwned = YES; }
+    t->_surf = surf; if (surf) { CFRetain(surf); t->_surfOwned = YES; t->_clientWritten = nvmtl_busy_foreign(surf, plane) != 0; }
     t->_plane = plane;
     t->_fmt = d.pixelFormat;
     t->_stex = t->_i.storage != 0;
@@ -1620,8 +1701,13 @@ void nvmtl_gl_tag_reflection(id refl, MTLRenderPipelineDescriptor *d);
             (uint32_t)d.tessellationFactorStepFunction, d.isTessellationFactorScaleEnabled ? 1u : 0u, (uint32_t)d.tessellationControlPointIndexType,
             mf, rl ? rl.intValue : -1 };
         prc = nvmtl_vk_pipeline_create_rt(vf->_spirv.bytes, vf->_spirv.length, fsb, fsl, &rt, vin.nattr ? &vin : NULL, rsc, &td, &ps->_p);
-    } else
+    } else {
         prc = nvmtl_vk_pipeline_create_rt(vf->_spirv.bytes, vf->_spirv.length, fsb, fsl, &rt, vin.nattr ? &vin : NULL, rsc, NULL, &ps->_p);
+        if (!prc)
+            nvmtl_vk_pipeline_try_gl_uniform(vf->_spirv.bytes, vf->_spirv.length, fsb, fsl,
+                nvmtl_gl_uniform_index(vf), nvmtl_gl_uniform_index(ff),
+                &rt, vin.nattr ? &vin : NULL, rsc, &ps->_p);
+    }
     if (prc) {
         nvlog("pipeline FAILED: %s / %s — see the vk: line above for the VkResult", vf->_fname.UTF8String ?: "?", ff->_fname.UTF8String ?: "?");
         return nvmtl_fail(err, [NSString stringWithFormat:@"pipeline: vkCreateGraphicsPipelines FAILED (%@ / %@)", vf->_fname, ff->_fname]); }

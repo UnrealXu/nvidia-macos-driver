@@ -46,6 +46,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); return 
   uint32_t _baseSlice, _baseLevel;
   uint32_t _surfSeed, _surfGen; BOOL _surfSynced, _surfOwned;
   nvk_buffer _vramBuf; BOOL _vramOn;
+  nvk_buffer _hostPages;   // this surface's pages imported for the host copies (nvmtl_host_pages), kept while they hold
   BOOL _stex;
   uint64_t _resid;
   NSUInteger _usage;
@@ -112,7 +113,7 @@ extern id gNVMTLMainDevice;
 @interface NVMTLCommandBuffer : NSObject <MTLCommandBuffer> {
   NSError *_cbError;
   NSMutableDictionary *_userDictionary;
-  @public nvk_cmdbuf _c; NVMTLCommandQueue *_queue; BOOL _committed, _commitMarking; BOOL _capacityHeld; MTLCommandBufferStatus _cbstatus;
+  @public nvk_cmdbuf _c; NVMTLCommandQueue *_queue; BOOL _committed, _commitMarking, _partsRetiring; BOOL _capacityHeld; MTLCommandBufferStatus _cbstatus;
   NVMTLTexture *_present;
   NSMutableArray *_presentations;
   NSMutableArray *_handlers;
@@ -286,6 +287,8 @@ NSUInteger nvmtl_air_max_tg(NVMTLFunction *fn);
 @interface NVMTLBuffer () { @public BOOL _subPlaced; } @end
 typedef struct { nvk_image img; uint32_t key[12]; NSUInteger off, len; } nvmtl_park_t;
 @interface NVMTLTexture () { @public BOOL _subPlaced, _parkable; uint32_t _pkey[12]; NSUInteger _pkLen; } @end
+@interface NVMTLTexture () { @public BOOL _clientWritten; } @end
+@interface NVMTLCommandBuffer () { @public NSDictionary *_busyMarks; } @end
 @interface NVMTLHeap () { @public nvmtl_park_t *_pk; uint32_t _npk; } @end
 @interface NVMTLBuffer () { @public nvmtl_park_t *_bpk; uint32_t _nbpk; os_unfair_lock _bpl; } @end
 @interface NVMTLTexture () { @public BOOL _bparkable; } @end

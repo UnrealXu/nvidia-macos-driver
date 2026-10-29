@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.6.4
+
+- three.js scenes with two or more shadow-casting lights no longer lose their WebGL2 context in Chrome, Brave and other browsers: the shader translator refused a shader's array of samplers (#426, patch by Luminous418). Each sampler in the array now reaches the shader with its own state. Known: WebGL shadow maps still draw the whole shadowed surface dark, with one light or several (it did in 2.6.3 too); that is the next fix.
+- Arrays of textures read the right texture: every element past the first read the first one, whether the index was fixed or computed in the shader. Shadow maps, texture atlases and material arrays in games and WebGL pages were affected.
+- Machinarium, and other apps whose shaders were built with older Metal tools, draw their scenes: the translator did not recognise a sampler written directly into the shader code, and refused the shader (patch by daggersinmybackk).
+
 ## 2.6.3
 
 - Infuse and other players that scale video with Apple's Lanczos filter play again: the shader that filter uses was refused, and the app stopped with "Unable to get MPS kernel lanczosVerticalScale" (#405). Its output now matches a real Mac's pixel for pixel.
